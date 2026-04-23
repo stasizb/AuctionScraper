@@ -93,6 +93,65 @@ class TestWorkbookToHtml(unittest.TestCase):
         self.assertIn("Summary by Model", html)
         self.assertIn("CR-V", html)
 
+    def test_mobile_structure_elements_present(self):
+        """Mobile features: data-field attrs, <details>, hamburger, mobile CSS."""
+        html = self._generate(client=FakeBidfaxClient())
+
+        # data-field / data-label on every <td> that mobile CSS targets
+        self.assertIn('data-field="model"',          html)
+        self.assertIn('data-field="year"',           html)
+        self.assertIn('data-field="odometer"',       html)
+        self.assertIn('data-field="lot-number"',     html)
+        self.assertIn('data-field="price"',          html)
+        self.assertIn('data-field="link"',           html)
+        self.assertIn('data-field="primary-damage"', html)
+        self.assertIn('data-field="vin"',            html)
+
+        # Model filter and summary wrapped in <details> (open by default)
+        self.assertIn('<details class="summary-section" open>', html)
+        self.assertIn('<details class="model-filter" open>',    html)
+
+        # Hamburger button present
+        self.assertIn('id="mobile-menu-btn"', html)
+
+    def test_mobile_css_and_js_constants(self):
+        """Mobile rules and hooks present in the inline CSS / JS constants."""
+        css = workbook_to_html.CSS
+        js  = workbook_to_html.JS
+
+        self.assertIn("@media (max-width: 768px)", css)
+        self.assertIn('data-field="model"',        css)
+        self.assertIn("mobile-menu-btn",           css)
+
+        # 2-row card grid: Model/Price/Odo/Link on row 1, Damage spans row 2
+        self.assertIn('grid-template-areas', css)
+        self.assertIn('"model price odo link"', css)
+        self.assertIn('"dmg   dmg   dmg dmg"', css)
+
+        # Fields hidden on mobile cards include Year, VIN, Lot Number
+        self.assertIn('data-field="year"', css)
+        self.assertIn('data-field="vin"',  css)
+        self.assertIn('data-field="lot-number"', css)
+
+        # Price column: right-aligned + fixed width so it lines up across cards
+        self.assertIn('grid-template-columns: 1fr 85px 90px 70px', css)
+
+        # Link: right-aligned via justify-self:end
+        self.assertIn('justify-self: end', css)
+
+        # Today's cards hide Price
+        self.assertIn(".today-table tbody td[data-field=\"price\"] { display: none; }", css)
+
+        # Hamburger menu: tabs hidden by default, drawer shown as list-style
+        self.assertIn(".tab-strip { display: none; }", css)
+        self.assertIn("body.menu-open .tab-strip",     css)
+        self.assertIn("flex-direction: column",        css)  # drawer is a list, not a row
+
+        self.assertIn("sortByAuctionDateDesc", js)
+        self.assertIn("Auction Date",          js)
+        self.assertIn("matchMedia",            js)
+        self.assertIn("menu-open",             js)
+
 
 if __name__ == "__main__":
     unittest.main()

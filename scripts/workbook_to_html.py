@@ -38,9 +38,10 @@ from clients import bidfax
 # Constants
 # ---------------------------------------------------------------------------
 
-_HYPERLINK_RE = re.compile(r'=HYPERLINK\("([^"]+)"', re.IGNORECASE)
-_PRICE_RE     = re.compile(r'^\$([\d,]+)$')
-_NUMERIC_COLS = {"Year", "Odometer", "Price"}
+_HYPERLINK_RE    = re.compile(r'=HYPERLINK\("([^"]+)"', re.IGNORECASE)
+_PRICE_RE        = re.compile(r'^\$([\d,]+)$')
+_NUMERIC_COLS    = {"Year", "Odometer", "Price"}
+_AUCTION_DATE_COL = "Auction Date"
 
 # ---------------------------------------------------------------------------
 # CSS
@@ -133,25 +134,36 @@ header .subtitle { font-size: .85rem; opacity: .6; }
   color: var(--muted);
 }
 
-/* ── Model filter ──────────────────────────────────────────────── */
+/* ── Model filter (uses <details>) ─────────────────────────────── */
 .model-filter {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
   margin-bottom: 12px;
   padding: 10px 14px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }
+.model-filter[open] .model-chips { margin-top: 8px; }
 .model-filter-label {
   font-size: .76rem;
   font-weight: 600;
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: .05em;
-  margin-right: 4px;
+  cursor: pointer;
+  list-style: none;
+}
+.model-filter-label::-webkit-details-marker { display: none; }
+.model-filter-label::before {
+  content: "▸ ";
+  display: inline-block;
+  transition: transform .15s;
+}
+.model-filter[open] .model-filter-label::before { content: "▾ "; }
+.model-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
 }
 .model-chip {
   display: inline-flex;
@@ -169,7 +181,7 @@ header .subtitle { font-size: .85rem; opacity: .6; }
 .model-chip input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
 .model-chip.all-chip { font-weight: 600; }
 
-/* ── Summary section ───────────────────────────────────────────── */
+/* ── Summary section (uses <details>) ──────────────────────────── */
 .summary-section {
   margin-bottom: 14px;
   background: var(--surface);
@@ -177,14 +189,22 @@ header .subtitle { font-size: .85rem; opacity: .6; }
   border-radius: var(--radius);
   padding: 12px 16px;
 }
+.summary-section[open] .summary-table { margin-top: 8px; }
 .summary-label {
   font-size: .76rem;
   font-weight: 600;
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: .05em;
-  margin-bottom: 8px;
+  cursor: pointer;
+  list-style: none;
 }
+.summary-label::-webkit-details-marker { display: none; }
+.summary-label::before {
+  content: "▸ ";
+  display: inline-block;
+}
+.summary-section[open] .summary-label::before { content: "▾ "; }
 .summary-table {
   width: auto;
   font-size: .82rem;
@@ -352,6 +372,152 @@ tr.no-results td {
 }
 .today-table thead th:hover { background: #14532d; }
 .today-table tbody tr:nth-child(even) { background: var(--today-bg); }
+
+/* ── Mobile hamburger button (visible only on small screens) ───── */
+.mobile-menu-btn {
+  display: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 12px;
+  font-size: 1.1rem;
+  cursor: pointer;
+  line-height: 1;
+}
+.mobile-menu-btn:hover { background: var(--hover); border-color: var(--accent); }
+
+/* ── Mobile layout ────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  .container { padding: 12px; }
+  header { padding: 12px 16px; }
+  header h1 { font-size: 1.1rem; }
+
+  /* Hide search box on mobile */
+  .toolbar input[type="search"] { display: none; }
+  .toolbar { justify-content: space-between; }
+
+  /* Show hamburger; it toggles the model filter */
+  .mobile-menu-btn { display: inline-block; }
+
+  /* Summary + model filter start collapsed (JS strips [open] on load) */
+  .summary-section, .model-filter { padding: 8px 12px; }
+
+  /* ── Hamburger drawer menu ────────────────────────────────── */
+  /* Tabs are hidden by default; opening the menu turns the strip into a
+     vertical list so makes render as menu lines, not pill buttons. */
+  .tab-strip { display: none; }
+  body.menu-open .tab-strip {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    margin-bottom: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    overflow: hidden;
+  }
+  body.menu-open .tab-btn {
+    border: none;
+    border-bottom: 1px solid var(--border);
+    border-radius: 0;
+    padding: 10px 14px;
+    background: var(--surface);
+    color: var(--text);
+    text-align: left;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  body.menu-open .tab-btn:last-child { border-bottom: none; }
+  body.menu-open .tab-btn.active {
+    background: var(--accent);
+    color: #fff;
+  }
+  body.menu-open .tab-btn:not(.active) .badge {
+    background: var(--border);
+    color: var(--muted);
+  }
+
+  /* ── Table → 2-row card layout ─────────────────────────────── */
+  .table-wrap { max-height: none; overflow: visible; box-shadow: none; background: transparent; }
+  .filterable-table, .filterable-table tbody { display: block; }
+  .filterable-table thead { display: none; }
+
+  /* Fixed column widths make Price (and Odometer, Link) line up in a
+     visual column across cards. Model gets the remaining space. */
+  .filterable-table tbody tr {
+    display: grid;
+    grid-template-columns: 1fr 85px 90px 70px;
+    grid-template-areas:
+      "model price odo link"
+      "dmg   dmg   dmg dmg";
+    gap: 6px 10px;
+    align-items: center;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 1px 3px rgba(0,0,0,.04);
+  }
+  .filterable-table tbody tr:nth-child(even) { background: var(--surface); }
+  .filterable-table tbody tr:hover { background: var(--hover); }
+
+  .filterable-table tbody td {
+    padding: 0;
+    border-bottom: none;
+    font-size: .82rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+
+  /* Fields not shown on mobile cards */
+  .filterable-table td[data-field="make"],
+  .filterable-table td[data-field="fuel-type"],
+  .filterable-table td[data-field="location"],
+  .filterable-table td[data-field="auction-date"],
+  .filterable-table td[data-field="acv"],
+  .filterable-table td[data-field="year"],
+  .filterable-table td[data-field="vin"],
+  .filterable-table td[data-field="lot-number"] { display: none; }
+
+  /* Row 1: Model (bold, flex) | Price (right) | Odometer (right) | Link (right) */
+  .filterable-table td[data-field="model"] {
+    grid-area: model;
+    font-weight: 700;
+    font-size: .95rem;
+  }
+  .filterable-table td[data-field="price"] {
+    grid-area: price;
+    text-align: right;
+    font-size: .9rem;
+  }
+  .filterable-table td[data-field="odometer"] {
+    grid-area: odo;
+    text-align: right;
+  }
+  .filterable-table td[data-field="link"] {
+    grid-area: link;
+    justify-self: end;
+  }
+
+  /* Row 2: Damage (left, spans the whole row) */
+  .filterable-table td[data-field="primary-damage"] {
+    grid-area: dmg;
+    text-align: left;
+  }
+
+  /* Emoji labels on the fields that remain */
+  .filterable-table td[data-field="odometer"]::before     { content: "🚗 "; }
+  .filterable-table td[data-field="price"]::before        { content: "💲 "; }
+  .filterable-table td[data-field="primary-damage"]::before { content: "⚠️ "; }
+
+  .filterable-table td.cell-model { max-width: none; }
+
+  /* Today's Auctions cards: no price (lots haven't been priced yet) */
+  .today-table tbody td[data-field="price"] { display: none; }
+}
 """
 
 # ---------------------------------------------------------------------------
@@ -488,9 +654,60 @@ JS = """\
     });
   });
 
+  /* ── Default sort: Auction Date descending (newest first) ───── */
+  function sortByAuctionDateDesc(table) {
+    var headers = table.querySelectorAll('thead th');
+    for (var i = 0; i < headers.length; i++) {
+      var th = headers[i];
+      var first = null;
+      th.childNodes.forEach(function (n) {
+        if (!first && n.nodeType === Node.TEXT_NODE && n.textContent.trim()) {
+          first = n.textContent.trim();
+        }
+      });
+      if (first === 'Auction Date') {
+        th.click();   /* first click: asc */
+        th.click();   /* second click: desc */
+        return;
+      }
+    }
+  }
+
+  document.querySelectorAll('table.filterable-table').forEach(sortByAuctionDateDesc);
+
+  /* ── Mobile: start with details collapsed + menu closed ─────── */
+  var mobileMQ = window.matchMedia('(max-width: 768px)');
+  if (mobileMQ.matches) {
+    document.querySelectorAll('details.summary-section, details.model-filter')
+      .forEach(function (d) { d.removeAttribute('open'); });
+  }
+
+  /* Hamburger toggles the whole mobile menu (make tabs + model filter) */
+  var hamburger = document.getElementById('mobile-menu-btn');
+  if (hamburger) {
+    hamburger.addEventListener('click', function () {
+      var open = document.body.classList.toggle('menu-open');
+      /* When the menu opens, also expand the model filter so it's usable */
+      var panel = activePanel();
+      if (panel) {
+        var filter = panel.querySelector('details.model-filter');
+        if (filter) filter.open = open;
+      }
+    });
+  }
+
+  /* Tapping a tab on mobile closes the menu so the cards are visible again */
+  document.querySelectorAll('.tab-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      if (mobileMQ.matches) {
+        document.body.classList.remove('menu-open');
+      }
+    });
+  });
+
   /* ── Init sort icons + first panel ──────────────────────────── */
   document.querySelectorAll('thead th .sort-icon').forEach(function (el) {
-    el.textContent = ' ⇅';
+    if (!el.textContent) el.textContent = ' ⇅';
   });
   var firstPanel = document.querySelector('.tab-panel.active');
   if (firstPanel) applyFilters(firstPanel);
@@ -583,11 +800,33 @@ def _extract_url(value) -> str | None:
 _MODEL_MAX_LEN = 35
 
 
+def _field_slug(header: str) -> str:
+    """Normalise 'Lot Number' -> 'lot-number' for the data-field CSS hook."""
+    return re.sub(r"[^a-z0-9]+", "-", header.lower()).strip("-")
+
+
+def _td_attrs(header: str, extra: str = "") -> str:
+    """Build the common data-field / data-label attrs for a <td>."""
+    slug = _field_slug(header)
+    return f'data-field="{slug}" data-label="{_html.escape(header)}" {extra}'.strip()
+
+
 def _model_cell_html(raw: str) -> str:
+    attrs = _td_attrs("Model", 'class="cell-model"')
     if len(raw) <= _MODEL_MAX_LEN:
-        return f'<td class="cell-model">{_html.escape(raw)}</td>'
-    return (f'<td class="cell-model" title="{_html.escape(raw)}">'
+        return f'<td {attrs}>{_html.escape(raw)}</td>'
+    return (f'<td {attrs} title="{_html.escape(raw)}">'
             f'{_html.escape(raw[:_MODEL_MAX_LEN])}…</td>')
+
+
+def _link_cell_html(raw: str) -> str:
+    url = _extract_url(raw) or (raw if raw.startswith("http") else "")
+    if not url:
+        return f"<td {_td_attrs('Link')}></td>"
+    klass = "cell-bidfax" if _BIDFAX_DOMAIN in url else "cell-link"
+    label = "Bidfax"      if _BIDFAX_DOMAIN in url else "View"
+    attrs = _td_attrs("Link", f'class="{klass}"')
+    return f'<td {attrs}><a href="{_html.escape(url)}" target="_blank">{label}</a></td>'
 
 
 def _cell_html(header: str, value) -> str:
@@ -595,26 +834,19 @@ def _cell_html(header: str, value) -> str:
 
     if header == "Model":
         return _model_cell_html(raw)
-
     if header == "Link":
-        url = _extract_url(raw) or (raw if raw.startswith("http") else "")
-        if not url:
-            return "<td></td>"
-        if _BIDFAX_DOMAIN in url:
-            return f'<td class="cell-bidfax"><a href="{_html.escape(url)}" target="_blank">Bidfax</a></td>'
-        return f'<td class="cell-link"><a href="{_html.escape(url)}" target="_blank">View</a></td>'
-
+        return _link_cell_html(raw)
     if header == "Price":
-        return f'<td class="cell-price">{_html.escape(raw)}</td>'
-
+        attrs = _td_attrs(header, 'class="cell-price"')
+        return f'<td {attrs}>{_html.escape(raw)}</td>'
     if header == "VIN":
-        return f'<td class="cell-vin">{_html.escape(raw)}</td>'
-
+        attrs = _td_attrs(header, 'class="cell-vin"')
+        return f'<td {attrs}>{_html.escape(raw)}</td>'
     if header in _NUMERIC_COLS:
         numeric = re.sub(r"[^\d.]", "", raw) or "0"
-        return f'<td data-raw="{_html.escape(numeric)}">{_html.escape(raw)}</td>'
-
-    return f"<td>{_html.escape(raw)}</td>"
+        attrs   = _td_attrs(header)
+        return f'<td {attrs} data-raw="{_html.escape(numeric)}">{_html.escape(raw)}</td>'
+    return f'<td {_td_attrs(header)}>{_html.escape(raw)}</td>'
 
 
 def _thead_html(headers: list) -> str:
@@ -678,13 +910,14 @@ def _summary_section_html(data_rows, headers: list[str]) -> str:
             f"</tr>"
         )
 
+    # Open by default; JS closes it on mobile screens.
     return (
-        '<div class="summary-section">'
-        '<div class="summary-label">Summary by Model</div>'
+        '<details class="summary-section" open>'
+        '<summary class="summary-label">Summary by Model</summary>'
         '<table class="summary-table no-sort">'
         "<thead><tr><th>Model</th><th>Count</th><th>Avg&nbsp;Price</th></tr></thead>"
         f"<tbody>{rows_html}</tbody>"
-        "</table></div>"
+        "</table></details>"
     )
 
 
@@ -695,7 +928,7 @@ def _summary_section_html(data_rows, headers: list[str]) -> str:
 def _model_filter_html(models: list[str]) -> str:
     if not models:
         return ""
-    chips = ['<span class="model-filter-label">Model</span>']
+    chips = []
     chips.append(
         '<label class="model-chip all-chip">'
         '<input type="checkbox" class="model-cb" data-all="1" checked> All</label>'
@@ -706,7 +939,13 @@ def _model_filter_html(models: list[str]) -> str:
             f'<label class="model-chip">'
             f'<input type="checkbox" class="model-cb" value="{e}" checked> {e}</label>'
         )
-    return f'<div class="model-filter">{"".join(chips)}</div>'
+    # Open by default; JS closes it on mobile screens (hamburger button re-opens).
+    return (
+        '<details class="model-filter" open>'
+        '<summary class="model-filter-label">Model</summary>'
+        f'<div class="model-chips">{"".join(chips)}</div>'
+        '</details>'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -718,7 +957,7 @@ def _get_cell_value(h: str, row, src_idx: dict, vin: str, vin_to_url: dict | Non
     raw = row[i].value if i >= 0 else None
     if h == "Link":
         return _resolve_link(raw, vin, vin_to_url)
-    if h == "Auction Date" and raw:
+    if h == _AUCTION_DATE_COL and raw:
         return _normalize_auction_date(str(raw).strip())
     return raw
 
@@ -751,7 +990,7 @@ def _today_tbody_html(today_rows: list[dict], headers: list[str]) -> str:
                 val = ""
             else:
                 val = str(row.get(h, "") or "").strip()
-                if h == "Auction Date":
+                if h == _AUCTION_DATE_COL:
                     val = _normalize_auction_date(val)
             cells.append(_cell_html(h, val))
         model_attr = f' data-model="{_html.escape(model)}"' if model else ""
@@ -832,7 +1071,7 @@ def _today_only_panel_content(today_rows: list[dict]) -> tuple[str, int]:
         cells = []
         for h in headers:
             val = str(row.get(h, "") or "").strip()
-            if h == "Auction Date":
+            if h == _AUCTION_DATE_COL:
                 val = _normalize_auction_date(val)
             cells.append(_cell_html(h, val))
         model_attr = f' data-model="{_html.escape(model)}"' if model else ""
@@ -992,6 +1231,7 @@ def _build_html(
 <div class="container">
   <div class="tab-strip">{"".join(tab_btns)}</div>
   <div class="toolbar">
+    <button id="mobile-menu-btn" class="mobile-menu-btn" aria-label="Toggle model filter">☰</button>
     <input id="search-input" type="search" placeholder="Filter visible table…">
     <span class="row-count" id="row-count"></span>
   </div>

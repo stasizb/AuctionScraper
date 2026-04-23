@@ -127,9 +127,60 @@
     });
   });
 
+  /* ── Default sort: Auction Date descending (newest first) ───── */
+  function sortByAuctionDateDesc(table) {
+    var headers = table.querySelectorAll('thead th');
+    for (var i = 0; i < headers.length; i++) {
+      var th = headers[i];
+      var first = null;
+      th.childNodes.forEach(function (n) {
+        if (!first && n.nodeType === Node.TEXT_NODE && n.textContent.trim()) {
+          first = n.textContent.trim();
+        }
+      });
+      if (first === 'Auction Date') {
+        th.click();   /* first click: asc */
+        th.click();   /* second click: desc */
+        return;
+      }
+    }
+  }
+
+  document.querySelectorAll('table.filterable-table').forEach(sortByAuctionDateDesc);
+
+  /* ── Mobile: start with details collapsed + menu closed ─────── */
+  var mobileMQ = window.matchMedia('(max-width: 768px)');
+  if (mobileMQ.matches) {
+    document.querySelectorAll('details.summary-section, details.model-filter')
+      .forEach(function (d) { d.removeAttribute('open'); });
+  }
+
+  /* Hamburger toggles the whole mobile menu (make tabs + model filter) */
+  var hamburger = document.getElementById('mobile-menu-btn');
+  if (hamburger) {
+    hamburger.addEventListener('click', function () {
+      var open = document.body.classList.toggle('menu-open');
+      /* When the menu opens, also expand the model filter so it's usable */
+      var panel = activePanel();
+      if (panel) {
+        var filter = panel.querySelector('details.model-filter');
+        if (filter) filter.open = open;
+      }
+    });
+  }
+
+  /* Tapping a tab on mobile closes the menu so the cards are visible again */
+  document.querySelectorAll('.tab-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      if (mobileMQ.matches) {
+        document.body.classList.remove('menu-open');
+      }
+    });
+  });
+
   /* ── Init sort icons + first panel ──────────────────────────── */
   document.querySelectorAll('thead th .sort-icon').forEach(function (el) {
-    el.textContent = ' ⇅';
+    if (!el.textContent) el.textContent = ' ⇅';
   });
   var firstPanel = document.querySelector('.tab-panel.active');
   if (firstPanel) applyFilters(firstPanel);
