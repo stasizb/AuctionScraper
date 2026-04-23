@@ -29,6 +29,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.columns import PRICE_COL, VIN_COL
+from core.dates   import normalize_auction_date
+
+AUCTION_DATE_COL = "Auction Date"
+LINK_COL         = "Link"
+MAKE_COL         = "Make"
 
 try:
     import openpyxl
@@ -145,9 +150,13 @@ def _cell_value(col: str, row: dict, price: str, vin: str) -> str:
         return price
     if col == VIN_COL:
         return vin
-    if col == "Link":
-        url = row.get("Link", "").strip()
+    if col == LINK_COL:
+        url = row.get(LINK_COL, "").strip()
         return f'=HYPERLINK("{url}")' if url else ""
+    if col == AUCTION_DATE_COL:
+        # Belt-and-suspenders: even if the upstream CSV wasn't normalized,
+        # the workbook ends up with the canonical form.
+        return normalize_auction_date(row.get(AUCTION_DATE_COL, ""))
     return row.get(col, "")
 
 
@@ -176,7 +185,7 @@ def process_csv(csv_path: Path, wb: openpyxl.Workbook) -> int:
 
         for row in reader:
             price, vin = _extract_price_vin(row, fieldnames)
-            make  = (row.get("Make") or "UNKNOWN").strip().upper()
+            make  = (row.get(MAKE_COL) or "UNKNOWN").strip().upper()
             ws    = _get_or_create_sheet(wb, make, headers)
             title = ws.title
             if title not in sheet_hdrs:
@@ -185,6 +194,33 @@ def process_csv(csv_path: Path, wb: openpyxl.Workbook) -> int:
             added += 1
 
     return added
+
+
+def normalize_existing_auction_dates(wb: openpyxl.Workbook) -> int:
+    """Rewrite any stale 'Auction Date' cell to the canonical UTC form.
+
+    Historical rows imported before date normalization was in place will
+    still hold raw IAAI strings like 'Tue Apr 21, 8:30am CDT'. Running this
+    once per build heals them in place; cells already in canonical form are
+    left alone.
+    """
+    changed = 0
+    for ws in wb.worksheets:
+        first_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        if not first_row:
+            continue
+        headers = list(first_row)
+        if AUCTION_DATE_COL not in headers:
+            continue
+        col_i = headers.index(AUCTION_DATE_COL) + 1
+        for row in ws.iter_rows(min_row=2):
+            cell = row[col_i - 1]
+            raw  = str(cell.value or "")
+            fixed = normalize_auction_date(raw)
+            if fixed != raw:
+                cell.value = fixed
+                changed += 1
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +254,7 @@ def main() -> None:
     print(f"[*] Already processed : {len(processed)}")
     print(f"[*] To process now    : {len(pending)}")
 
-    if not pending:
+    if not pending and not workbook_path.exists():
         print("[+] Nothing new to process.")
         return
 
@@ -229,6 +265,11 @@ def main() -> None:
         print(f"[*] Creating: {workbook_path.name}")
         wb = openpyxl.Workbook()
         wb.remove(wb.active)          # drop the default blank sheet
+
+    # Heal any stale 'Auction Date' cells left over from older imports.
+    healed = normalize_existing_auction_dates(wb)
+    if healed:
+        print(f"[*] Normalized {healed} stale Auction Date cell(s)")
 
     total_added = 0
     for csv_path in pending:
@@ -242,6 +283,10 @@ def main() -> None:
         ws = wb.create_sheet("No Data")
         ws.append(["No data was imported."])
         print("[warn] No sheets created — adding placeholder sheet.")
+
+    if total_added == 0 and healed == 0:
+        print("[+] Nothing changed; skipping save.")
+        return
 
     wb.save(workbook_path)
     save_log(log_path, processed)

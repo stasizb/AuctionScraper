@@ -106,19 +106,14 @@ class TestPriceFixParseLots(unittest.TestCase):
 
 
 class TestWorkbookToHtmlDates(unittest.TestCase):
-    def test_normalise_iaai_date(self):
-        out = workbook_to_html._normalize_auction_date("Thu Apr 09, 8:30am CDT")
-        self.assertIn("04-09", out)
-        self.assertIn("08:30", out)
-        self.assertIn("CDT", out)
+    """Thin sanity checks — full coverage lives in tests/unit/test_dates.py."""
 
-    def test_normalise_pm_date(self):
-        out = workbook_to_html._normalize_auction_date("Thu Apr 09, 1:30pm CDT")
-        self.assertIn("13:30", out)
-
-    def test_leaves_already_normalised(self):
-        s = "2026-04-09 13:30 UTC"
-        self.assertEqual(workbook_to_html._normalize_auction_date(s), s)
+    def test_workbook_to_html_reexports_normalizer(self):
+        # Cell rendering calls workbook_to_html._normalize_auction_date, which
+        # must be the same function that core.dates provides.
+        import core.dates
+        self.assertIs(workbook_to_html._normalize_auction_date,
+                      core.dates.normalize_auction_date)
 
     def test_model_key_first_word(self):
         self.assertEqual(workbook_to_html._model_key("GLE 350 4MATIC"), "GLE")

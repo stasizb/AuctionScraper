@@ -6,6 +6,7 @@ from tests._helpers import ROOT  # noqa: F401
 
 from clients.iaai import (
     FakeIAAIClient, OUTPUT_FIELDS,
+    _parse_scraped_row,
     apply_equipment_postfilter, equipment_matches,
     parse_filter_row, read_filters_csv,
 )
@@ -81,6 +82,33 @@ class TestEquipmentPostfilter(unittest.TestCase):
     def test_empty_equipment_keeps_all(self):
         rows = [{"_full_title": "x"}, {"_full_title": "y"}]
         self.assertEqual(len(apply_equipment_postfilter(rows, "")), 2)
+
+
+class TestParseScrapedRow(unittest.TestCase):
+    """_parse_scraped_row is where the IAAI auction date gets normalized."""
+
+    def test_auction_date_converted_to_utc(self):
+        raw = {
+            "Make": "HONDA", "Model": "CR-V", "Year": "2024",
+            "Lot Number": "44444444", "Link": "https://iaai/x",
+            "Auction Date": "Tue Apr 21, 8:30am CDT",
+        }
+        record = _parse_scraped_row(raw)
+        self.assertIsNotNone(record)
+        # 8:30 CDT = 13:30 UTC (DST, UTC-5)
+        self.assertEqual(record["Auction Date"][-4:], " UTC")
+        self.assertIn("13:30", record["Auction Date"])
+
+    def test_already_canonical_date_untouched(self):
+        raw = {"Link": "https://iaai/x",
+               "Auction Date": "2026-04-21 13:30 UTC"}
+        record = _parse_scraped_row(raw)
+        self.assertEqual(record["Auction Date"], "2026-04-21 13:30 UTC")
+
+    def test_empty_date_left_empty(self):
+        raw = {"Link": "https://iaai/x", "Auction Date": ""}
+        record = _parse_scraped_row(raw)
+        self.assertEqual(record["Auction Date"], "")
 
 
 class TestFakeIAAIClient(unittest.TestCase):

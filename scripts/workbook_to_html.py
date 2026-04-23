@@ -33,6 +33,7 @@ except ImportError:
     sys.exit("openpyxl not found.  Install with:  pip install openpyxl")
 
 from clients import bidfax
+from core.dates import normalize_auction_date as _normalize_auction_date
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -267,6 +268,11 @@ table {
   font-size: .83rem;
 }
 
+/* Filterable grids (main + today) share a <colgroup> so columns line up
+   even when the today-grid has empty cells. table-layout: fixed makes
+   the col widths authoritative — content doesn't override them. */
+.filterable-table { table-layout: fixed; }
+
 thead th {
   position: sticky;
   top: 0;
@@ -291,6 +297,9 @@ tbody td {
   padding: 7px 12px;
   border-bottom: 1px solid var(--border);
   vertical-align: top;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ── Special cells ─────────────────────────────────────────────── */
@@ -849,6 +858,36 @@ def _cell_html(header: str, value) -> str:
     return f'<td {_td_attrs(header)}>{_html.escape(raw)}</td>'
 
 
+# Fixed column widths — applied via <colgroup> so the main grid and the
+# "Today's Auctions" grid share exactly the same layout, even when one of
+# the tables has empty columns (e.g. Today's auctions have no Price yet).
+# Values sum to ~1460px; with table-layout: fixed + width: 100% the
+# browser scales them proportionally to fit the viewport.
+_COL_WIDTHS = {
+    "Make":           "100px",
+    "Model":          "180px",
+    "Year":            "55px",
+    "Odometer":        "80px",
+    "Price":           "85px",
+    "Fuel Type":       "80px",
+    "Lot Number":     "100px",
+    "Link":            "75px",
+    "Auction Date":   "160px",
+    "Location":       "140px",
+    "Primary Damage": "140px",
+    "VIN":            "160px",
+    "ACV":            "110px",
+}
+
+
+def _colgroup_html(headers: list) -> str:
+    """Shared column widths for main + today tables so columns line up."""
+    cols = "".join(
+        f'<col style="width: {_COL_WIDTHS.get(h, "auto")}">' for h in headers
+    )
+    return f"<colgroup>{cols}</colgroup>"
+
+
 def _thead_html(headers: list) -> str:
     cells = "".join(
         f'<th data-type="{"number" if h in _NUMERIC_COLS else "text"}">'
@@ -1005,39 +1044,6 @@ def _today_tbody_html(today_rows: list[dict], headers: list[str]) -> str:
 # Model key helper
 # ---------------------------------------------------------------------------
 
-# Matches IAAI format: "Thu Apr 09, 8:30am CDT"
-_IAAI_DATE_RE = re.compile(
-    r'^\w{3}\s+(\w{3})\s+(\d{1,2}),\s*(\d{1,2}):(\d{2})(am|pm)\s+(\w+)$',
-    re.IGNORECASE,
-)
-_MONTH_MAP = {
-    "jan": "01", "feb": "02", "mar": "03", "apr": "04",
-    "may": "05", "jun": "06", "jul": "07", "aug": "08",
-    "sep": "09", "oct": "10", "nov": "11", "dec": "12",
-}
-
-
-def _normalize_auction_date(value: str) -> str:
-    """Normalize IAAI date strings to the Copart format: YYYY-MM-DD HH:MM TZ.
-
-    'Thu Apr 09, 8:30am CDT' → '2026-04-09 08:30 CDT'
-    Already-normalized values are returned unchanged.
-    """
-    m = _IAAI_DATE_RE.match(value.strip())
-    if not m:
-        return value
-    month_str, day_str, hour_str, minute_str, ampm, tz = m.groups()
-    month  = _MONTH_MAP.get(month_str.lower(), "01")
-    day    = day_str.zfill(2)
-    hour   = int(hour_str)
-    if ampm.lower() == "pm" and hour != 12:
-        hour += 12
-    elif ampm.lower() == "am" and hour == 12:
-        hour = 0
-    # Use current year — IAAI dates don't include year
-    year = date.today().year
-    return f"{year}-{month}-{day} {hour:02d}:{minute_str} {tz.upper()}"
-
 def _model_key(model: str) -> str:
     """Return the first word of a model string for grouping/filtering.
 
@@ -1083,6 +1089,7 @@ def _today_only_panel_content(today_rows: list[dict]) -> tuple[str, int]:
 
     table = (
         f'<table class="filterable-table main-table">'
+        f"{_colgroup_html(headers)}"
         f"{_thead_html(headers)}"
         f"{tbody}"
         f"</table>"
@@ -1130,8 +1137,11 @@ def _ws_to_panel_content(
     filter_html  = _model_filter_html(models)
     summary_html = _summary_section_html(data_rows, headers)
 
+    colgroup = _colgroup_html(headers)
+
     main_table = (
         f'<table class="filterable-table main-table">'
+        f"{colgroup}"
         f"{_thead_html(headers)}"
         f"{_tbody_html(data_rows, headers, vin_idx, vin_to_url)}"
         f"</table>"
@@ -1141,6 +1151,7 @@ def _ws_to_panel_content(
     if today_rows:
         today_table = (
             f'<table class="filterable-table today-table">'
+            f"{colgroup}"
             f"{_thead_html(headers)}"
             f"{_today_tbody_html(today_rows, headers)}"
             f"</table>"
@@ -1155,11 +1166,13 @@ def _ws_to_panel_content(
             "</div>"
         )
 
+    # Today's Auctions goes first — active lots the user is deciding on
+    # right now are more useful than the historical grid underneath.
     content = (
         filter_html
         + summary_html
-        + f'<div class="table-wrap">{main_table}</div>'
         + today_section
+        + f'<div class="table-wrap">{main_table}</div>'
     )
     return content, len(data_rows)
 

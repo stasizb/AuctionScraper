@@ -25,6 +25,7 @@ from typing import Callable, Protocol, runtime_checkable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.chrome import find_chrome
+from core.dates  import normalize_auction_date
 
 try:
     import nodriver as uc
@@ -39,9 +40,11 @@ except ImportError:
 
 IAAI_SEARCH_URL = "https://www.iaai.com/Search"
 
+AUCTION_DATE_COL = "Auction Date"
+
 OUTPUT_FIELDS = [
     "Make", "Model", "Year", "Odometer", "Fuel Type",
-    "Lot Number", "Link", "Auction Date", "Location",
+    "Lot Number", "Link", AUCTION_DATE_COL, "Location",
     "Primary Damage", "ACV",
 ]
 
@@ -151,6 +154,10 @@ def _parse_scraped_row(r: dict) -> dict | None:
     for field in ("Year", "Make", "Model"):
         if not record[field]:
             record[field] = r.get(field, "")
+    # Normalize IAAI's local-time dates to the canonical UTC form so every
+    # consumer (price CSVs, workbook, HTML) sees the same shape.
+    if record.get(AUCTION_DATE_COL):
+        record[AUCTION_DATE_COL] = normalize_auction_date(record[AUCTION_DATE_COL])
     record["_full_title"] = r.get("_full_title", "")
     return record if record.get("Link") else None
 
