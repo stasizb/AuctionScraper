@@ -28,6 +28,7 @@ Each day the pipeline:
 ├── bidfax_info.py          # Looks up prices on bidfax.info
 ├── bidfax_lib.py           # Shared bidfax.info browser library
 ├── price_refresh.py        # Retries In Progress prices across all CSVs
+├── price_fix.py            # Re-fetches bidfax data for specific lot numbers
 ├── build_workbook.py       # Builds Excel workbook from price CSVs
 ├── workbook_to_html.py     # Generates HTML report from workbook
 ├── bidcars_info.py         # Alternative price lookup via bid.cars
@@ -136,6 +137,29 @@ python bidfax_info.py --auction copart --date 2026_04_07
 # Retry all In Progress rows across all price CSVs
 python price_refresh.py
 ```
+
+### Fix specific lots
+
+When a lot ends up with the wrong bidfax Link / Price / VIN (the initial search matched a different vehicle), re-run the lookup and overwrite every matching row across CSVs, workbook, and HTML report.
+
+```bash
+# One or more lot numbers, comma-separated
+python price_fix.py --lots "44428368, 44428369, 44428360"
+
+# Single lot, pointing at a specific directory
+python price_fix.py --lots 44428368 --dir output
+
+# Attach to an already-running Chrome (shared session)
+python price_fix.py --lots 44428368 --browser-port 9222
+```
+
+Updates all three in-place:
+
+- `output/<auction>_price_<date>.csv`  (every date, every match)
+- `output/auction_results.xlsx`        (all sheets)
+- `output/html_report/index.html`      (all tables)
+
+Lots not found on bidfax.info are reported and skipped.
 
 ### Build workbook
 
