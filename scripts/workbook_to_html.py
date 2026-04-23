@@ -451,14 +451,16 @@ tr.no-results td {
   .filterable-table, .filterable-table tbody { display: block; }
   .filterable-table thead { display: none; }
 
-  /* Fixed column widths make Price (and Odometer, Link) line up in a
-     visual column across cards. Model gets the remaining space. */
+  /* Fixed Price/Link column widths make those lines up across cards.
+     Odometer is placed directly under Price (shares col 2) so the two
+     right-aligned values form a vertical pair. Model takes the remaining
+     space, giving longer model names more room to breathe. */
   .filterable-table tbody tr {
     display: grid;
-    grid-template-columns: 1fr 85px 90px 70px;
+    grid-template-columns: 1fr 85px 70px;
     grid-template-areas:
-      "model price odo link"
-      "dmg   dmg   dmg dmg";
+      "model price link"
+      "dmg   odo   .";
     gap: 6px 10px;
     align-items: center;
     padding: 10px 12px;
@@ -514,7 +516,7 @@ tr.no-results td {
     justify-self: end;
   }
 
-  /* Row 2: Damage (left, spans the whole row) */
+  /* Row 2: Damage (col 1, left) | Odometer sits directly under Price */
   .filterable-table td[data-field="primary-damage"] {
     grid-area: dmg;
     text-align: left;

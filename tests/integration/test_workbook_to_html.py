@@ -123,10 +123,11 @@ class TestWorkbookToHtml(unittest.TestCase):
         self.assertIn('data-field="model"',        css)
         self.assertIn("mobile-menu-btn",           css)
 
-        # 2-row card grid: Model/Price/Odo/Link on row 1, Damage spans row 2
+        # 2-row card grid: Model/Price/Link on row 1;
+        # Damage + Odometer on row 2 (Odo under Price, col 3 empty)
         self.assertIn('grid-template-areas', css)
-        self.assertIn('"model price odo link"', css)
-        self.assertIn('"dmg   dmg   dmg dmg"', css)
+        self.assertIn('"model price link"', css)
+        self.assertIn('"dmg   odo   ."',     css)
 
         # Fields hidden on mobile cards include Year, VIN, Lot Number
         self.assertIn('data-field="year"', css)
@@ -134,7 +135,7 @@ class TestWorkbookToHtml(unittest.TestCase):
         self.assertIn('data-field="lot-number"', css)
 
         # Price column: right-aligned + fixed width so it lines up across cards
-        self.assertIn('grid-template-columns: 1fr 85px 90px 70px', css)
+        self.assertIn('grid-template-columns: 1fr 85px 70px', css)
 
         # Link: right-aligned via justify-self:end
         self.assertIn('justify-self: end', css)
