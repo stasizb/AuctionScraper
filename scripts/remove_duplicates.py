@@ -54,6 +54,21 @@ def write_rows(path: Path, fieldnames: list[str], rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+def remove_duplicate_lots(src_path: Path, dest_path: Path) -> int:
+    """Remove rows from `src_path` whose Lot Number exists in `dest_path`.
+
+    Rewrites `src_path` in place. Returns the count of removed rows.
+    `dest_path` is not modified.
+    """
+    dest_lots        = read_lot_numbers(dest_path)
+    fieldnames, rows = read_rows(src_path)
+    kept       = [r for r in rows if r[LOT_COLUMN].strip() not in dest_lots]
+    removed    = len(rows) - len(kept)
+    if removed:
+        write_rows(src_path, fieldnames, kept)
+    return removed
+
+
 def main() -> None:
     today     = date.today()
     yesterday = today - timedelta(days=1)

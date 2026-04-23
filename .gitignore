@@ -1,11 +1,21 @@
-caches/chrome_profile_shared/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Claude Code / editor state
+.claude/
+
+# Runtime caches, logs, filters (local config)
+caches/
+logs/
+filters/
+
+# Derived/runtime artifacts in output/
 output/copart*
 output/iaai*
-output/html_report/*
-output/*
-logs/*
-caches/*
-__pycache__/*
-filters/*
-.claude/*
-.claude
+output/auction_results.xlsx
+output/processed_files.json

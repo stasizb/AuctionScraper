@@ -16,58 +16,26 @@ USAGE:
 """
 
 import argparse
-import csv
-import re
 import sys
 from pathlib import Path
 
-import bidfax_lib
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from clients import bidfax
+from core.columns  import IN_PROGRESS, LOT_COL, MAKE_COL, PRICE_COL, VIN_COL
+from core.csv_io   import PRICE_FILE_PATTERN, find_price_files, load_csv_dict, save_csv_dict
+from core.workbook import apply_result_to_row, resolve_columns
 
 try:
     import openpyxl
 except ImportError:
     sys.exit("openpyxl not found. Install with:  pip install openpyxl")
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-PRICE_COL       = "Price"
-VIN_COL         = "VIN"
-LOT_COL         = "Lot Number"
-IN_PROGRESS     = "In Progress"
-FILE_PATTERN    = re.compile(
-    r"^(iaai|copart)_price_(\d{4})_(\d{2})_(\d{2})\.csv$",
-    re.IGNORECASE,
-)
-
-
-# ---------------------------------------------------------------------------
-# CSV helpers
-# ---------------------------------------------------------------------------
-
-def _find_price_files(directory: Path, auction: str) -> list[Path]:
-    files = []
-    for path in sorted(directory.glob("*.csv")):
-        m = FILE_PATTERN.match(path.name)
-        if m and (auction == "all" or m.group(1).lower() == auction.lower()):
-            files.append(path)
-    return files
-
-
-def _load_csv(path: Path) -> tuple[list[str], list[dict]]:
-    with path.open(newline="", encoding="utf-8-sig") as fh:
-        reader     = csv.DictReader(fh)
-        fieldnames = list(reader.fieldnames or [])
-        rows       = list(reader)
-    return fieldnames, rows
-
-
-def _save_csv(path: Path, fieldnames: list[str], rows: list[dict]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
+# Backwards-compatible aliases for tests and any external imports
+FILE_PATTERN      = PRICE_FILE_PATTERN
+_find_price_files = find_price_files
+_load_csv         = load_csv_dict
+_save_csv         = save_csv_dict
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +64,7 @@ def _collect_pending(
             if row.get(PRICE_COL, "").strip() != IN_PROGRESS:
                 continue
             lot  = str(row.get(LOT_COL, "")).strip()
-            make = str(row.get("Make", "")).strip()
+            make = str(row.get(MAKE_COL, "")).strip()
             if lot:
                 pending[lot] = (path, make)
 
@@ -108,9 +76,11 @@ def _fetch_prices(
     cache_path: Path,
     delay: float,
     browser_port: int | None = None,
+    client: bidfax.BidfaxClient | None = None,
+    max_concurrent: int = 1,
 ) -> dict[str, tuple]:
     """Return confirmed (price, vin, url) for each lot, using cache where available."""
-    cache    = bidfax_lib.load_cache(cache_path)
+    cache    = bidfax.load_cache(cache_path)
     cached   = {lot: cache[lot] for lot in pending if lot in cache}
     to_fetch = [lot for lot in pending if lot not in cache]
 
@@ -122,7 +92,11 @@ def _fetch_prices(
     fetched: dict[str, tuple] = {}
     if to_fetch:
         makes   = {lot: pending[lot][1] for lot in to_fetch}
-        results = bidfax_lib.run_batch(to_fetch, delay, cache_path, makes=makes, browser_port=browser_port)
+        results = bidfax.run_batch(
+            to_fetch, delay, cache_path,
+            makes=makes, browser_port=browser_port, client=client,
+            max_concurrent=max_concurrent,
+        )
         fetched = {lot: v for lot, v in results.items() if v[0] != IN_PROGRESS}
 
     return {**cached, **fetched}
@@ -180,16 +154,21 @@ def _sheet_in_progress(ws) -> dict[str, str]:
     return result
 
 
-def _collect_workbook_pending(workbook_path: Path) -> dict[str, str]:
-    """Scan workbook for In Progress rows. Returns {lot: make} using sheet name as make."""
+def _open_workbook_collect_pending(workbook_path: Path):
+    """Open the workbook (writable) and collect {lot: make} of In Progress rows.
+
+    Returns (wb, pending). `wb` is None if the workbook does not exist. The
+    caller is responsible for saving and closing the workbook — this replaces
+    the old pair of functions that opened the file twice (read-only then
+    writable).
+    """
     if not workbook_path.exists():
-        return {}
-    wb = openpyxl.load_workbook(workbook_path, read_only=True)
+        return None, {}
+    wb = openpyxl.load_workbook(workbook_path)
     pending: dict[str, str] = {}
     for ws in wb.worksheets:
         pending.update(_sheet_in_progress(ws))
-    wb.close()
-    return pending
+    return wb, pending
 
 
 def _apply_results(
@@ -209,64 +188,40 @@ def _apply_results(
     return total_updated, updated_files
 
 
-def _ws_col_indices(headers: list) -> tuple[int, int | None, int | None, int | None] | None:
-    """Return (lot_col, price_col, vin_col, link_col) 1-based, or None if no Lot Number."""
-    if LOT_COL not in headers:
-        return None
-    lot   = headers.index(LOT_COL) + 1
-    price = (headers.index(PRICE_COL) + 1) if PRICE_COL in headers else None
-    vin   = (headers.index(VIN_COL)   + 1) if VIN_COL   in headers else None
-    link  = (headers.index("Link")    + 1) if "Link"    in headers else None
-    return lot, price, vin, link
-
-
-def _apply_result_to_row(row, price: str, vin: str, url: str,
-                          price_col: int | None, vin_col: int | None,
-                          link_col: int | None) -> None:
-    if price_col:
-        row[price_col - 1].value = price
-    if vin_col and vin:
-        row[vin_col - 1].value = vin
-    if link_col and url:
-        new_val = f'=HYPERLINK("{url}")'
-        if str(row[link_col - 1].value or "") != new_val:
-            row[link_col - 1].value = new_val
+def _apply_to_open_workbook(wb, all_results: dict[str, tuple]) -> int:
+    """Apply confirmed results to an already-open workbook. Does not save."""
+    total_updated = 0
+    for ws in wb.worksheets:
+        headers = list(next(ws.iter_rows(min_row=1, max_row=1, values_only=True), []))
+        cols = resolve_columns(headers)
+        if cols is None:
+            continue
+        for row in ws.iter_rows(min_row=2):
+            lot = str(row[cols.lot - 1].value or "").strip()
+            if lot not in all_results:
+                continue
+            price, vin, url = all_results[lot]
+            apply_result_to_row(row, cols, price, vin, url)
+            total_updated += 1
+    return total_updated
 
 
 def _update_workbook(workbook_path: Path, all_results: dict[str, tuple]) -> int:
-    """Update Price/VIN/Link cells in the workbook for confirmed lots.
+    """Legacy API: open, update, save in one call. Kept for backward compatibility.
 
-    Searches every sheet for a 'Lot Number' column, then updates matching rows.
-    Returns count of cells updated.
+    Prefer `_open_workbook_collect_pending` + `_apply_to_open_workbook` when you
+    need the pending-row scan — that avoids opening the file twice.
     """
     if not workbook_path.exists():
         print(f"  [skip] Workbook not found: {workbook_path}")
         return 0
-
     wb = openpyxl.load_workbook(workbook_path)
-    total_updated = 0
-
-    for ws in wb.worksheets:
-        headers = list(next(ws.iter_rows(min_row=1, max_row=1, values_only=True), []))
-        cols = _ws_col_indices(headers)
-        if cols is None:
-            continue
-        lot_col, price_col, vin_col, link_col = cols
-
-        for row in ws.iter_rows(min_row=2):
-            lot = str(row[lot_col - 1].value or "").strip()
-            if lot not in all_results:
-                continue
-            price, vin, url = all_results[lot]
-            _apply_result_to_row(row, price, vin, url, price_col, vin_col, link_col)
-            total_updated += 1
-
+    total_updated = _apply_to_open_workbook(wb, all_results)
     if total_updated:
         wb.save(workbook_path)
         print(f"  [+] Workbook updated ({total_updated} row(s)): {workbook_path.name}")
     else:
         print("  [*] No workbook rows matched.")
-
     return total_updated
 
 
@@ -288,6 +243,8 @@ def main() -> None:
                         help="Seconds between bidfax searches (default: 2.0)")
     parser.add_argument("--browser-port", type=int, default=None,
                         help="Connect to a running Chrome on this port instead of launching one")
+    parser.add_argument("--concurrent", type=int, default=1,
+                        help="Parallel bidfax tabs (default: 1 = sequential; experimental)")
     args = parser.parse_args()
 
     work_dir = Path(args.dir).resolve()
@@ -301,11 +258,12 @@ def main() -> None:
 
     file_data, pending = _collect_pending(files)
 
-    # Also collect In Progress rows directly from the workbook — covers the case
-    # where CSVs were already updated but the workbook wasn't.
+    # Open the workbook once (writable) and collect In Progress rows from it.
+    # Covers the case where CSVs were already updated but the workbook wasn't.
+    wb      = None
     wb_path = Path(args.workbook) if args.workbook else None
     if wb_path:
-        wb_pending = _collect_workbook_pending(wb_path)
+        wb, wb_pending = _open_workbook_collect_pending(wb_path)
         for lot, make in wb_pending.items():
             if lot not in pending:
                 pending[lot] = (None, make)  # type: ignore[assignment]
@@ -316,7 +274,10 @@ def main() -> None:
 
     print(f"[*] {len(pending)} lot(s) with In Progress status")
 
-    all_results = _fetch_prices(pending, Path(args.cache), args.delay, browser_port=args.browser_port)
+    all_results = _fetch_prices(
+        pending, Path(args.cache), args.delay,
+        browser_port=args.browser_port, max_concurrent=args.concurrent,
+    )
 
     if not all_results:
         print("[*] No confirmed prices retrieved.")
@@ -326,9 +287,20 @@ def main() -> None:
         total_updated, updated_files = _apply_results(file_data, all_results)
         print(f"\n[+] Refreshed {total_updated} row(s) across {updated_files} file(s)")
 
-    if wb_path:
-        print(f"\n[*] Propagating to workbook: {wb_path.name}")
-        _update_workbook(wb_path, all_results)
+    _save_workbook_results(wb, wb_path, all_results)
+
+
+def _save_workbook_results(wb, wb_path: Path | None, all_results: dict[str, tuple]) -> None:
+    """Apply confirmed results to an already-open workbook and save it."""
+    if wb is None or wb_path is None:
+        return
+    print(f"\n[*] Propagating to workbook: {wb_path.name}")
+    wb_updated = _apply_to_open_workbook(wb, all_results)
+    if wb_updated:
+        wb.save(wb_path)
+        print(f"  [+] Workbook updated ({wb_updated} row(s)): {wb_path.name}")
+    else:
+        print("  [*] No workbook rows matched.")
 
 
 if __name__ == "__main__":

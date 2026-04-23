@@ -1,0 +1,4 @@
+Make,Model,Year,Odometer,Price,Fuel Type,Lot Number,Link,Auction Date,Location,Primary Damage,VIN
+HONDA,CR-V,2024,"15,000","$18,500",Hybrid,11111111,https://bidfax.info/honda/cr-v/aaa-vin-abc1.html,2026-01-02 14:00 UTC,CO - DENVER,REAR END,ABC1
+HONDA,CR-V,2023,"20,000",In Progress,Hybrid,22222222,https://www.copart.com/lot/22222222/honda-cr-v,2026-01-02 15:00 UTC,TX - DALLAS,FRONT END,
+AUDI,Q5,2024,"10,000",In Progress,Gas,33333333,https://www.copart.com/lot/33333333/audi-q5,2026-01-02 16:00 UTC,CA - LOS ANGELES,SIDE,

@@ -25,14 +25,16 @@ Copart.com Web Scraper
 
 import argparse
 import csv
-import json
-import re
-import time
 import logging
-from datetime import datetime, timezone, timedelta
+import re
+import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-import requests
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from clients import copart as copart_client
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -43,31 +45,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-BASE_URL       = "https://www.copart.com"
-SEARCH_API_URL = f"{BASE_URL}/public/lots/search-results"
-
-# Headers that closely mimic a real Chrome browser request
-HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept":          "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Content-Type":    "application/json",
-    "Origin":          BASE_URL,
-    "Referer":         f"{BASE_URL}/lotSearchResults/",
-    "sec-ch-ua":       '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "sec-ch-ua-mobile":   "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "Sec-Fetch-Dest":  "empty",
-    "Sec-Fetch-Mode":  "cors",
-    "Sec-Fetch-Site":  "same-origin",
-}
-
-PAGE_SIZE     = 100
 REQUEST_DELAY = 2.0
+BASE_URL      = copart_client.BASE_URL
 
 
 # ---------------------------------------------------------------------------
@@ -116,147 +95,6 @@ def read_filters_csv(path: str) -> list[dict]:
                 continue
             filters_list.append(parse_filter_row(line))
     return filters_list
-
-
-# ---------------------------------------------------------------------------
-# Build Copart search payload
-#
-# Filter keys (confirmed from real Copart browser URLs):
-#   FETI -> lot_condition_code:CERT-D      (Run and Drive — always on)
-#   SDAT -> auction_date_utc:[ISO TO ISO]  (24h window    — always on)
-#   YEAR -> lot_year:[YYYY TO YYYY]
-#   MAKE -> lot_make_desc:"MAKE"
-#   MODL -> lot_model_desc:"MODEL"         (array for multiple models)
-#   FUEL -> fuel_type_desc:"HYBRID ENGINE" (full Copart label, uppercase)
-#   ODM  -> odometer_reading_received:[0 TO N]
-# ---------------------------------------------------------------------------
-
-def build_search_payload(filters: dict, page: int = 0) -> dict:
-    make   = filters.get("make", "")
-    models = filters.get("models") or []
-
-    api_filter = {}
-
-    # ---- Always: Run and Drive ----
-    api_filter["FETI"] = ["lot_condition_code:CERT-D"]
-
-    # ---- Year range ----
-    year_min = filters.get("year_min")
-    year_max = filters.get("year_max") or (datetime.now(tz=timezone.utc).year + 1)
-    y_from   = year_min if year_min else "*"
-    api_filter["YEAR"] = [f"lot_year:[{y_from} TO {year_max}]"]
-
-    # ---- Make ----
-    if make:
-        api_filter["MAKE"] = [f'lot_make_desc:"{make}"']
-
-    # ---- Model (one or many) ----
-    if models:
-        api_filter["MODL"] = [f'lot_model_desc:"{m}"' for m in models]
-
-    # ---- Fuel type (only if explicitly specified, no default) ----
-    fuel = filters.get("fuel_type")
-    if fuel:
-        api_filter["FUEL"] = [f'fuel_type_desc:"{fuel}"']
-
-    # ---- Odometer ----
-    odometer_max = filters.get("odometer_max")
-    if odometer_max is not None:
-        api_filter["ODM"] = [f"odometer_reading_received:[0 TO {odometer_max}]"]
-
-    # ---- Always: Auction today or tomorrow (48h window covers both days; matches Copart order) ----
-    now         = datetime.now(tz=timezone.utc)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_window  = today_start + timedelta(hours=47, minutes=59, seconds=59)
-    date_from   = today_start.strftime("%Y-%m-%dT%H:%M:%SZ")
-    date_to     = end_window.strftime("%Y-%m-%dT%H:%M:%SZ")
-    api_filter["SDAT"] = [f'auction_date_utc:["{date_from}" TO "{date_to}"]']
-
-    return {
-        "query":          ["*"],
-        "filter":         api_filter,
-        "sort":           None,
-        "page":           page,
-        "size":           PAGE_SIZE,
-        "start":          page * PAGE_SIZE,
-        "watchListOnly":  False,
-        "freeFormSearch": False,
-        "searchName":     "",
-    }
-
-
-# ---------------------------------------------------------------------------
-# HTTP session — mimic a real browser as closely as possible
-# ---------------------------------------------------------------------------
-
-def make_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    # Step 1: visit homepage to get initial cookies (JSESSIONID etc.)
-    try:
-        r = session.get(BASE_URL, timeout=15)
-        log.info(f"Homepage: HTTP {r.status_code} | cookies: {list(session.cookies.keys())}")
-    except Exception as e:
-        log.warning(f"Homepage visit failed: {e}")
-
-    # Step 2: visit the search results page to get any additional cookies
-    try:
-        r = session.get(f"{BASE_URL}/lotSearchResults/", timeout=15)
-        log.info(f"Search page: HTTP {r.status_code} | cookies: {list(session.cookies.keys())}")
-    except Exception as e:
-        log.warning(f"Search page visit failed: {e}")
-
-    return session
-
-
-# ---------------------------------------------------------------------------
-# Fetch lots from API (all pages)
-# ---------------------------------------------------------------------------
-
-def fetch_lots(session: requests.Session, filters: dict) -> list[dict]:
-    all_lots = []
-    page = 0
-
-    while True:
-        payload = build_search_payload(filters, page=page)
-        log.info(
-            f"  Page {page} | query={payload['query']} "
-            f"| filter keys={list(payload['filter'].keys())}"
-        )
-        log.info(f"  Payload: {json.dumps(payload)}")
-
-        try:
-            resp = session.post(SEARCH_API_URL, json=payload, timeout=30)
-            log.info(f"  Response: HTTP {resp.status_code} | size={len(resp.content)} bytes")
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.HTTPError as e:
-            log.error(f"  HTTP {e.response.status_code}: {e.response.text[:600]}")
-            break
-        except Exception as e:
-            log.error(f"  Request error: {e}")
-            break
-
-        # Navigate response — Copart wraps results under data.results.content
-        results_data   = (data.get("data") or {}).get("results") or {}
-        content        = results_data.get("content", [])
-        total_elements = results_data.get("totalElements", 0)
-
-        if not content:
-            log.info("  Empty content, stopping.")
-            break
-
-        all_lots.extend(content)
-        log.info(f"  Got {len(content)} lots (total: {total_elements})")
-
-        if len(all_lots) >= total_elements or len(content) < PAGE_SIZE:
-            break
-
-        page += 1
-        time.sleep(REQUEST_DELAY)
-
-    return all_lots
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +169,7 @@ def lot_to_row(lot: dict, filters: dict) -> dict:
 # Main processing loop
 # ---------------------------------------------------------------------------
 
-def process_filters(filters: dict, session: requests.Session) -> list[dict]:
+def process_filters(filters: dict, client: copart_client.CopartClient) -> list[dict]:
     equipment = filters.get("equipment")
     log.info(
         f"  make={filters.get('make')} models={filters.get('models')} "
@@ -340,7 +178,7 @@ def process_filters(filters: dict, session: requests.Session) -> list[dict]:
         f"equipment={equipment}"
     )
 
-    raw_lots = fetch_lots(session, filters)
+    raw_lots = client.fetch_lots(filters)
     log.info(f"  {len(raw_lots)} lots from API → applying equipment post-filter...")
 
     matched = []
@@ -383,13 +221,13 @@ def main():
         log.error("No filter rows found. Check your CSV format.")
         return
 
-    session  = make_session()
+    client   = copart_client.HttpCopartClient(request_delay=args.delay)
     all_rows = []
 
     for idx, filters in enumerate(filters_list, 1):
         log.info(f"[{idx}/{len(filters_list)}] Processing filter row...")
         try:
-            rows = process_filters(filters, session)
+            rows = process_filters(filters, client)
             all_rows.extend(rows)
         except Exception as e:
             log.error(f"  Error: {e}")

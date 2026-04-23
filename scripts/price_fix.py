@@ -23,13 +23,16 @@ Usage:
 """
 
 import argparse
-import asyncio
-import csv
 import re
 import sys
 from pathlib import Path
 
-import bidfax_lib
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from clients import bidfax
+from core.columns  import LINK_COL, LOT_COL, PRICE_COL, VIN_COL
+from core.csv_io   import PRICE_FILE_PATTERN, load_csv_dict, save_csv_dict
+from core.workbook import apply_result_to_row, resolve_columns
 
 try:
     import openpyxl
@@ -42,26 +45,6 @@ try:
 except ImportError:
     _BS4_OK = False
 
-try:
-    import nodriver as uc
-    _NODRIVER_OK = True
-except ImportError:
-    _NODRIVER_OK = False
-
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-LOT_COL   = "Lot Number"
-PRICE_COL = "Price"
-VIN_COL   = "VIN"
-LINK_COL  = "Link"
-
-PRICE_FILE_PATTERN = re.compile(
-    r"^(iaai|copart)_price_(\d{4})_(\d{2})_(\d{2})\.csv$",
-    re.IGNORECASE,
-)
 
 _BIDFAX_DOMAIN = "bidfax.info"
 
@@ -79,58 +62,25 @@ def _parse_lots(arg: str) -> list[str]:
 # Bidfax lookup
 # ---------------------------------------------------------------------------
 
-async def _lookup_lots_async(
-    lots: list[str],
-    delay: float,
-    browser_port: int | None,
-) -> dict[str, tuple[str, str, str]]:
-    """Search every lot on bidfax in one browser session.
-
-    Returns {lot: (price, vin, url)} only for lots with a bidfax result URL.
-    """
-    if browser_port:
-        browser = await uc.start(host="127.0.0.1", port=browser_port)
-    else:
-        browser = await uc.start(
-            headless=False,
-            sandbox=False,
-            browser_args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-    results: dict[str, tuple[str, str, str]] = {}
-    try:
-        page = await browser.get(bidfax_lib.BIDFAX_HOME)
-        print("[*] Waiting for bidfax.info (Cloudflare)...")
-        await bidfax_lib._wait_cf_clear(page)
-        print("[+] Ready.")
-        for i, lot in enumerate(lots, 1):
-            print(f"  [bidfax {i}/{len(lots)}] {lot!r} ... ", end="", flush=True)
-            await page.get(bidfax_lib.BIDFAX_HOME)
-            await asyncio.sleep(2)
-            await bidfax_lib._wait_cf_clear(page)
-            price, vin, url = await bidfax_lib.search_bidfax(page, lot)
-            if url:
-                results[lot] = (price, vin, url)
-                print(f"{price}  VIN:{vin or '—'}  {url}")
-            else:
-                print("not found — SKIPPED")
-            if i < len(lots):
-                await asyncio.sleep(delay)
-    finally:
-        try:
-            await browser.stop()
-        except Exception:
-            pass
-    return results
-
-
 def lookup_lots(
     lots: list[str],
     delay: float,
     browser_port: int | None,
+    client: bidfax.BidfaxClient | None = None,
+    max_concurrent: int = 1,
 ) -> dict[str, tuple[str, str, str]]:
-    if not _NODRIVER_OK:
-        sys.exit("nodriver is required. Install with:  pip install nodriver")
-    return asyncio.run(_lookup_lots_async(lots, delay, browser_port))
+    """Re-fetch bidfax data for each lot. Returns only lots with a result URL."""
+    real_client = client or bidfax.BrowserBidfaxClient(browser_port=browser_port)
+    fetched     = real_client.lookup_many(lots, delay=delay, max_concurrent=max_concurrent)
+    results: dict[str, tuple[str, str, str]] = {}
+    for lot in lots:
+        price, vin, url = fetched.get(lot, (bidfax.IN_PROGRESS, "", ""))
+        if url:
+            results[lot] = (price, vin, url)
+            print(f"  [bidfax] {lot} — {price}  VIN:{vin or '—'}  {url}")
+        else:
+            print(f"  [bidfax] {lot} — not found, SKIPPED")
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -138,11 +88,7 @@ def lookup_lots(
 # ---------------------------------------------------------------------------
 
 def _fix_csv_file(path: Path, results: dict[str, tuple[str, str, str]]) -> int:
-    with path.open(newline="", encoding="utf-8-sig") as fh:
-        reader     = csv.DictReader(fh)
-        fieldnames = list(reader.fieldnames or [])
-        rows       = list(reader)
-
+    fieldnames, rows = load_csv_dict(path)
     changed = 0
     for row in rows:
         lot = str(row.get(LOT_COL, "")).strip()
@@ -155,12 +101,8 @@ def _fix_csv_file(path: Path, results: dict[str, tuple[str, str, str]]) -> int:
         if url:
             row[LINK_COL] = url
         changed += 1
-
     if changed:
-        with path.open("w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
+        save_csv_dict(path, fieldnames, rows)
     return changed
 
 
@@ -196,25 +138,17 @@ def fix_workbook(workbook_path: Path, results: dict[str, tuple[str, str, str]]) 
 
     for ws in wb.worksheets:
         headers = list(next(ws.iter_rows(min_row=1, max_row=1, values_only=True), []))
-        if LOT_COL not in headers:
+        cols = resolve_columns(headers)
+        if cols is None:
             continue
-        lot_c   = headers.index(LOT_COL)   + 1
-        price_c = headers.index(PRICE_COL) + 1 if PRICE_COL in headers else None
-        vin_c   = headers.index(VIN_COL)   + 1 if VIN_COL   in headers else None
-        link_c  = headers.index(LINK_COL)  + 1 if LINK_COL  in headers else None
 
         sheet_updated = 0
         for row in ws.iter_rows(min_row=2):
-            lot = str(row[lot_c - 1].value or "").strip()
+            lot = str(row[cols.lot - 1].value or "").strip()
             if lot not in results:
                 continue
             price, vin, url = results[lot]
-            if price_c:
-                row[price_c - 1].value = price
-            if vin_c and vin:
-                row[vin_c - 1].value = vin
-            if link_c and url:
-                row[link_c - 1].value = f'=HYPERLINK("{url}")'
+            apply_result_to_row(row, cols, price, vin, url)
             sheet_updated += 1
 
         if sheet_updated:
@@ -342,6 +276,8 @@ def main() -> None:
                         help="Seconds between bidfax searches (default: 2.0)")
     parser.add_argument("--browser-port",   type=int, default=None,
                         help="Connect to a running Chrome on this port instead of launching one")
+    parser.add_argument("--concurrent",     type=int, default=1,
+                        help="Parallel bidfax tabs (default: 1 = sequential; experimental)")
     args = parser.parse_args()
 
     lots = _parse_lots(args.lots)
@@ -358,7 +294,8 @@ def main() -> None:
     print(f"HTML     : {html_path}")
     print(f"Delay    : {args.delay}s\n")
 
-    results = lookup_lots(lots, args.delay, args.browser_port)
+    results = lookup_lots(lots, args.delay, args.browser_port,
+                          max_concurrent=args.concurrent)
 
     missing = [l for l in lots if l not in results]
     if missing:

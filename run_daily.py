@@ -41,7 +41,9 @@ import time
 from datetime import date, timedelta
 from pathlib import Path
 
-_CHROME_EXE = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from core.chrome import find_chrome
 
 
 def _free_port() -> int:
@@ -65,9 +67,10 @@ def _start_shared_chrome(profile_dir: Path) -> tuple[subprocess.Popen, int]:
     """Launch a single Chrome instance shared across all pipeline steps."""
     port = _free_port()
     profile_dir.mkdir(parents=True, exist_ok=True)
+    chrome_exe = find_chrome()
     proc = subprocess.Popen(
         [
-            _CHROME_EXE,
+            chrome_exe,
             f"--remote-debugging-port={port}",
             "--remote-debugging-host=127.0.0.1",
             "--no-first-run", "--no-sandbox",
@@ -102,6 +105,25 @@ def _find_recent_search(output_dir: Path, auction: str, before: date, max_days: 
     return None
 
 
+# ---------------------------------------------------------------------------
+# Step-status tracking (for end-of-run summary)
+# ---------------------------------------------------------------------------
+
+# Ordered list of (name, status, detail) tuples, populated as the pipeline runs.
+# status is one of: "ok", "fail", "skipped"
+_step_results: list[tuple[str, str, str]] = []
+
+
+def _record(name: str, status: str, detail: str = "") -> None:
+    _step_results.append((name, status, detail))
+
+
+def skip(step_name: str, reason: str) -> None:
+    """Record a skipped step in the summary (non-failing)."""
+    print(f"\n[SKIP] {step_name} — {reason}")
+    _record(step_name, "skipped", reason)
+
+
 def run(step_name: str, cmd: list[str]) -> None:
     """Run a command, printing a header. Exit if the process fails."""
     print(f"\n{'=' * 60}")
@@ -112,9 +134,11 @@ def run(step_name: str, cmd: list[str]) -> None:
     result = subprocess.run(cmd)
     if result.returncode != 0:
         print(f"\n[FAIL] {step_name} exited with code {result.returncode} — stopping.")
+        _record(step_name, "fail", f"exit {result.returncode}")
         sys.exit(result.returncode)
 
     print(f"\n[OK] {step_name}")
+    _record(step_name, "ok")
 
 
 def run_parallel(steps: list[tuple[str, list[str]]]) -> None:
@@ -139,7 +163,10 @@ def run_parallel(steps: list[tuple[str, list[str]]]) -> None:
         )
         with _lock:
             print(header + (proc.stdout or "") + (proc.stderr or "") + footer, flush=True)
-            if proc.returncode != 0:
+            if proc.returncode == 0:
+                _record(name, "ok")
+            else:
+                _record(name, "fail", f"exit {proc.returncode}")
                 failures.append((name, proc.returncode))
 
     threads = [threading.Thread(target=_run_one, args=s) for s in steps]
@@ -152,6 +179,29 @@ def run_parallel(steps: list[tuple[str, list[str]]]) -> None:
         for name, rc in failures:
             print(f"\n[FAIL] {name} exited with code {rc} — stopping.")
         sys.exit(failures[0][1])
+
+
+def _print_summary() -> None:
+    if not _step_results:
+        return
+    print(f"\n{'=' * 60}")
+    print("[SUMMARY] Daily pipeline")
+    print(f"{'=' * 60}")
+
+    counts   = {"ok": 0, "fail": 0, "skipped": 0}
+    width    = max(len(name) for name, _, _ in _step_results)
+    for name, status, detail in _step_results:
+        counts[status] = counts.get(status, 0) + 1
+        mark = {"ok": "✓", "fail": "✗", "skipped": "-"}.get(status, "?")
+        label = {"ok": "OK", "fail": "FAIL", "skipped": "SKIPPED"}.get(status, status.upper())
+        line = f"  {mark}  {name.ljust(width)}    {label}"
+        if detail:
+            line += f"  ({detail})"
+        print(line)
+
+    print(f"\n  totals: {counts['ok']} ok, "
+          f"{counts['skipped']} skipped, "
+          f"{counts['fail']} failed")
 
 
 def main() -> None:
@@ -177,8 +227,8 @@ def main() -> None:
     output  = root / "output"
 
     def s(name: str) -> str:
-        """Full path to a script in the project root."""
-        return str(root / name)
+        """Full path to a script inside the scripts/ directory."""
+        return str(root / "scripts" / name)
 
     def o(name: str) -> str:
         """Full path to a file in the output directory."""
@@ -225,7 +275,8 @@ def main() -> None:
                 "--dest", o(f"copart_search_{today}.csv"),
             ]))
         else:
-            print("\n[SKIP] Step 3 — no recent copart search file found.")
+            skip("3. Remove Copart duplicates (yesterday vs today)",
+                 "no recent copart search file found")
 
         if iaai_date:
             phase2.append(("5. Bidfax prices — IAAI (yesterday)", [
@@ -238,7 +289,8 @@ def main() -> None:
                 *bp,
             ]))
         else:
-            print("\n[SKIP] Step 5 — no recent iaai search file found.")
+            skip("5. Bidfax prices — IAAI (yesterday)",
+                 "no recent iaai search file found")
 
         if len(phase2) > 1:
             run_parallel(phase2)
@@ -259,7 +311,8 @@ def main() -> None:
                 *bp,
             ])
         else:
-            print("\n[SKIP] Step 4 — no recent copart search file found.")
+            skip("4. Bidfax prices — Copart (yesterday)",
+                 "no recent copart search file found")
 
         run("6. Refresh In Progress prices", [
             py, s("price_refresh.py"),
@@ -289,6 +342,7 @@ def main() -> None:
     finally:
         chrome_proc.terminate()
         print("\n[*] Shared Chrome terminated.")
+        _print_summary()
 
     print(f"\n{'=' * 60}")
     print("[DONE] Daily pipeline completed successfully.")

@@ -26,20 +26,19 @@ import sys
 from datetime import date
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core.columns import PRICE_COL, VIN_COL
+
 try:
     import openpyxl
 except ImportError:
     sys.exit("openpyxl not found. Install with:  pip install openpyxl")
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 LAST_PRICE_COL  = "Last Price"
-PRICE_COL       = "Price"
-VIN_COL         = "VIN"
 
-# Matches both  copart_price_…  and  copart_bidfax_…
+# Broader than core.csv_io.PRICE_FILE_PATTERN: also matches the legacy
+# `_bidfax_` file prefix so historical CSVs still get imported.
 AUCTION_PATTERN = re.compile(
     r"^(iaai|copart)_(price|bidfax)_(\d{4})_(\d{2})_(\d{2})\.csv$",
     re.IGNORECASE,

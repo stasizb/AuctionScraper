@@ -22,16 +22,29 @@ Each day the pipeline:
 .
 ├── run_daily.py            # Orchestrator — runs the full pipeline
 │
-├── copart_search.py        # Scrapes Copart lots via internal API
-├── iaai_search.py          # Scrapes IAAI lots via browser automation
-├── remove_duplicates.py    # Removes rescheduled lots between days
-├── bidfax_info.py          # Looks up prices on bidfax.info
-├── bidfax_lib.py           # Shared bidfax.info browser library
-├── price_refresh.py        # Retries In Progress prices across all CSVs
-├── price_fix.py            # Re-fetches bidfax data for specific lot numbers
-├── build_workbook.py       # Builds Excel workbook from price CSVs
-├── workbook_to_html.py     # Generates HTML report from workbook
-├── bidcars_info.py         # Alternative price lookup via bid.cars
+├── scripts/                # Individual pipeline steps (CLI entry points)
+│   ├── copart_search.py        # Scrapes Copart lots via internal API
+│   ├── iaai_search.py          # Scrapes IAAI lots via browser automation
+│   ├── remove_duplicates.py    # Removes rescheduled lots between days
+│   ├── bidfax_info.py          # Looks up prices on bidfax.info
+│   ├── price_refresh.py        # Retries In Progress prices across all CSVs
+│   ├── price_fix.py            # Re-fetches bidfax data for specific lot numbers
+│   ├── build_workbook.py       # Builds Excel workbook from price CSVs
+│   ├── workbook_to_html.py     # Generates HTML report from workbook
+│   └── bidcars_info.py         # Alternative price lookup via bid.cars
+│
+├── clients/                # External-system abstractions (swap real ⇄ fake in tests)
+│   ├── bidfax.py               # BidfaxClient + BrowserBidfaxClient + FakeBidfaxClient
+│   ├── copart.py               # CopartClient + HttpCopartClient + FakeCopartClient
+│   └── iaai.py                 # IAAIClient + BrowserIAAIClient + FakeIAAIClient
+│
+├── core/                   # Shared pure-Python helpers (populated by future refactors)
+│
+├── tests/
+│   ├── unit/                   # Fast tests on pure helpers (parsers, regex, etc.)
+│   ├── integration/            # Script-level tests driven by Fake clients
+│   ├── fixtures/csv/           # Trimmed CSVs used as test input
+│   └── run_tests.py            # Stdlib test runner (no pytest required)
 │
 ├── filters/                # Search filter definitions
 │   ├── copart_filters.csv
@@ -109,33 +122,33 @@ Each script can be run standalone with sensible defaults.
 ### Search
 
 ```bash
-python copart_search.py                          # uses filters/copart_filters.csv
-python iaai_search.py                            # uses filters/iaai_filters.csv
+python scripts/copart_search.py                          # uses filters/copart_filters.csv
+python scripts/iaai_search.py                            # uses filters/iaai_filters.csv
 ```
 
 ### Deduplicate
 
 ```bash
 # Remove yesterday's Copart lots that reappear in today's search
-python remove_duplicates.py --auction copart
+python scripts/remove_duplicates.py --auction copart
 ```
 
 ### Price lookup
 
 ```bash
 # Yesterday's lots (default)
-python bidfax_info.py --auction copart
-python bidfax_info.py --auction iaai
+python scripts/bidfax_info.py --auction copart
+python scripts/bidfax_info.py --auction iaai
 
 # Specific date
-python bidfax_info.py --auction copart --date 2026_04_07
+python scripts/bidfax_info.py --auction copart --date 2026_04_07
 ```
 
 ### Refresh stale prices
 
 ```bash
 # Retry all In Progress rows across all price CSVs
-python price_refresh.py
+python scripts/price_refresh.py
 ```
 
 ### Fix specific lots
@@ -144,13 +157,13 @@ When a lot ends up with the wrong bidfax Link / Price / VIN (the initial search 
 
 ```bash
 # One or more lot numbers, comma-separated
-python price_fix.py --lots "44428368, 44428369, 44428360"
+python scripts/price_fix.py --lots "44428368, 44428369, 44428360"
 
 # Single lot, pointing at a specific directory
-python price_fix.py --lots 44428368 --dir output
+python scripts/price_fix.py --lots 44428368 --dir output
 
 # Attach to an already-running Chrome (shared session)
-python price_fix.py --lots 44428368 --browser-port 9222
+python scripts/price_fix.py --lots 44428368 --browser-port 9222
 ```
 
 Updates all three in-place:
@@ -164,17 +177,30 @@ Lots not found on bidfax.info are reported and skipped.
 ### Build workbook
 
 ```bash
-python build_workbook.py --dir output/
+python scripts/build_workbook.py --dir output/
 ```
 
 ### Generate HTML report
 
 ```bash
-python workbook_to_html.py
-python workbook_to_html.py --workbook output/auction_results.xlsx \
+python scripts/workbook_to_html.py
+python scripts/workbook_to_html.py --workbook output/auction_results.xlsx \
   --out output/html_report --search-dir output \
   --bidfax-cache caches/bidfax_cache.json
 ```
+
+---
+
+## Testing
+
+```bash
+python tests/run_tests.py                  # all tests
+python tests/run_tests.py unit             # fast unit tests only
+python tests/run_tests.py integration      # integration tests with Fake clients
+python tests/run_tests.py -v               # verbose
+```
+
+Tests use the stdlib `unittest` runner — no pytest required. All browser-dependent scripts accept an optional `client=` parameter (e.g. `bidfax_info.process(..., client=FakeBidfaxClient(...))`) so tests run entirely in memory against canned responses. See `tests/integration/` for the patterns.
 
 ---
 

@@ -25,12 +25,14 @@ import sys
 from datetime import date
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 try:
     import openpyxl
 except ImportError:
     sys.exit("openpyxl not found.  Install with:  pip install openpyxl")
 
-import bidfax_lib
+from clients import bidfax
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -537,8 +539,17 @@ def _collect_vins(wb: openpyxl.Workbook) -> set[str]:
     return vins
 
 
-def _lookup_bidfax_urls(vins: set[str], cache_path: Path, delay: float, browser_port: int | None = None) -> dict[str, str]:
-    return bidfax_lib.run_batch_vins(sorted(vins), delay, cache_path, browser_port=browser_port)
+def _lookup_bidfax_urls(
+    vins: set[str],
+    cache_path: Path,
+    delay: float,
+    browser_port: int | None = None,
+    client: bidfax.BidfaxClient | None = None,
+) -> dict[str, str]:
+    return bidfax.run_batch_vins(
+        sorted(vins), delay, cache_path,
+        browser_port=browser_port, client=client,
+    )
 
 
 # ---------------------------------------------------------------------------

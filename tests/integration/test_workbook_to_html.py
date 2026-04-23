@@ -1,0 +1,98 @@
+"""Integration tests for scripts/workbook_to_html.py using --no-bidfax and FakeBidfaxClient."""
+
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+
+import openpyxl
+
+from tests._helpers import CSV_FIXTURES, ROOT  # noqa: F401
+
+import workbook_to_html
+from clients.bidfax import FakeBidfaxClient
+
+
+def _build_test_workbook(path: Path) -> None:
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    ws = wb.create_sheet("HONDA")
+    ws.append(["Make", "Model", "Year", "Odometer", "Price", "Fuel Type",
+               "Lot Number", "Link", "Auction Date", "Location",
+               "Primary Damage", "VIN"])
+    ws.append(["HONDA", "CR-V", 2024, "15,000", "$18,500", "Hybrid",
+               "11111111", '=HYPERLINK("https://bidfax.info/honda/cr-v/one.html")',
+               "2026-01-02 14:00 UTC", "CO - DENVER", "REAR END", "VIN111"])
+    ws.append(["HONDA", "CR-V", 2023, "20,000", "$17,000", "Hybrid",
+               "22222222", '=HYPERLINK("https://www.copart.com/lot/22222222/honda-cr-v")',
+               "2026-01-02 15:00 UTC", "TX - DALLAS", "FRONT END", "VIN222"])
+    wb.save(path)
+
+
+class TestWorkbookToHtml(unittest.TestCase):
+    def setUp(self):
+        self._tmp     = tempfile.TemporaryDirectory()
+        self.work_dir = Path(self._tmp.name)
+        self.workbook_path = self.work_dir / "auction_results.xlsx"
+        _build_test_workbook(self.workbook_path)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _generate(self, client=None, search_dir: Path | None = None, today_date="2026_01_02"):
+        out_dir = self.work_dir / "html_report"
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        out_dir.mkdir(parents=True)
+
+        wb      = openpyxl.load_workbook(self.workbook_path)
+        vins    = workbook_to_html._collect_vins(wb)
+        vin_to_url = (workbook_to_html._lookup_bidfax_urls(
+            vins, self.work_dir / "cache.json", delay=0, client=client,
+        ) if client is not None else None)
+
+        today_lots = workbook_to_html._load_today_lots(
+            search_dir or self.work_dir, today_date,
+        )
+        html = workbook_to_html._build_html(wb, "Test", vin_to_url, today_lots)
+        (out_dir / "index.html").write_text(html, encoding="utf-8")
+        return (out_dir / "index.html").read_text()
+
+    def test_render_with_bidfax_link_kept(self):
+        """A row whose Link is already bidfax should render a 'Bidfax' button."""
+        html = self._generate(client=FakeBidfaxClient())
+        self.assertIn("cell-bidfax",                 html)
+        self.assertIn("bidfax.info/honda/cr-v/one",  html)
+        self.assertIn(">Bidfax<",                    html)
+
+    def test_render_with_fallback_link(self):
+        """A row whose Link is NOT bidfax renders as 'View' button."""
+        html = self._generate(client=FakeBidfaxClient())
+        self.assertIn("cell-link", html)
+        self.assertIn(">View<",    html)
+
+    def test_vin_lookup_resolves_to_bidfax_button(self):
+        """Fake bidfax supplies a URL for VIN222 — Link cell should use it."""
+        fake = FakeBidfaxClient(responses={
+            "VIN222": ("$17,000", "VIN222", "https://bidfax.info/honda/cr-v/resolved-vin-vin222.html"),
+        })
+        html = self._generate(client=fake)
+        self.assertIn("resolved-vin-vin222", html)
+
+    def test_today_section_rendered_from_csv(self):
+        """Today's search CSV should add a 'Today's Auctions' section."""
+        shutil.copy(CSV_FIXTURES / "copart_search_2026_01_02.csv", self.work_dir)
+        html = self._generate(client=FakeBidfaxClient(),
+                              search_dir=self.work_dir, today_date="2026_01_02")
+        self.assertIn("Today", html)
+        # today's lot numbers from the fixture
+        self.assertIn("11111111", html)
+
+    def test_summary_section_rendered(self):
+        html = self._generate(client=FakeBidfaxClient())
+        self.assertIn("Summary by Model", html)
+        self.assertIn("CR-V", html)
+
+
+if __name__ == "__main__":
+    unittest.main()
