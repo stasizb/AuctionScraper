@@ -652,6 +652,7 @@ async def _start_chrome(
 # Entry point
 # ---------------------------------------------------------------------------
 
+
 async def main(input_path: str, output_path: str, profile_dir: str,
                browser_port: int | None = None) -> None:
     print(f"[*] Reading filters from: {input_path}")
@@ -664,15 +665,21 @@ async def main(input_path: str, output_path: str, profile_dir: str,
     if browser_port:
         print(f"[*] Connecting to shared Chrome on port {browser_port} …")
         chrome_proc = None
-        browser = await uc.start(host="127.0.0.1", port=browser_port)
+        browser = await asyncio.wait_for(
+            uc.start(host="127.0.0.1", port=browser_port),
+            timeout=30.0,
+        )
     else:
         port = _free_port()
         print(f"[*] Starting Chrome on port {port} (profile: {profile_dir}) …")
         chrome_proc = await _start_chrome(port, profile_dir)
         print("[*] Chrome ready — connecting nodriver …")
-        browser = await uc.start(host="127.0.0.1", port=port)
+        browser = await asyncio.wait_for(
+            uc.start(host="127.0.0.1", port=port),
+            timeout=30.0,
+        )
 
-    page = await browser.get(IAAI_SEARCH_URL)
+    page = await asyncio.wait_for(browser.get(IAAI_SEARCH_URL), timeout=30.0)
     await asyncio.sleep(WAIT_LONG)
 
     all_results: list[dict] = []
@@ -689,11 +696,11 @@ async def main(input_path: str, output_path: str, profile_dir: str,
                 traceback.print_exc()
                 await asyncio.sleep(3)
     finally:
-        try:
-            await browser.stop()
-        except Exception:
-            pass
         if chrome_proc:
+            try:
+                await browser.stop()
+            except Exception:
+                pass
             chrome_proc.terminate()
 
     write_output_csv(output_path, all_results)

@@ -1,7 +1,11 @@
 caches/chrome_profile_shared/
 output/copart*
 output/iaai*
+output/html_report/*
+output/*
 logs/*
 caches/*
 __pycache__/*
 filters/*
+.claude/*
+.claude
