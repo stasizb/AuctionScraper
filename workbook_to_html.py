@@ -797,6 +797,52 @@ def _model_key(model: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Today-only panel builder (no workbook)
+# ---------------------------------------------------------------------------
+
+def _today_only_panel_content(today_rows: list[dict]) -> tuple[str, int]:
+    """Build panel content from today's CSV lots when no workbook is present."""
+    if not today_rows:
+        return "<p>No data.</p>", 0
+
+    headers = list(today_rows[0].keys())
+
+    models = sorted({
+        _model_key(str(r.get("Model", "") or "").strip())
+        for r in today_rows
+        if _model_key(str(r.get("Model", "") or "").strip())
+    })
+
+    filter_html = _model_filter_html(models)
+
+    parts = []
+    for row in today_rows:
+        model = _model_key(str(row.get("Model", "") or "").strip())
+        cells = []
+        for h in headers:
+            val = str(row.get(h, "") or "").strip()
+            if h == "Auction Date":
+                val = _normalize_auction_date(val)
+            cells.append(_cell_html(h, val))
+        model_attr = f' data-model="{_html.escape(model)}"' if model else ""
+        parts.append(f"<tr{model_attr}>{''.join(cells)}</tr>")
+
+    n = len(headers)
+    parts.append(f'<tr class="no-results" style="display:none"><td colspan="{n}">No matching rows.</td></tr>')
+    tbody = f"<tbody>{''.join(parts)}</tbody>"
+
+    table = (
+        f'<table class="filterable-table main-table">'
+        f"{_thead_html(headers)}"
+        f"{tbody}"
+        f"</table>"
+    )
+
+    content = filter_html + f'<div class="table-wrap">{table}</div>'
+    return content, len(today_rows)
+
+
+# ---------------------------------------------------------------------------
 # Per-panel builder
 # ---------------------------------------------------------------------------
 
@@ -873,7 +919,7 @@ def _ws_to_panel_content(
 # ---------------------------------------------------------------------------
 
 def _build_html(
-    wb: openpyxl.Workbook,
+    wb: openpyxl.Workbook | None,
     title: str,
     vin_to_url: dict | None,
     today_lots: dict[str, list[dict]],
@@ -881,24 +927,43 @@ def _build_html(
     tab_btns = []
     panels   = []
 
-    for i, name in enumerate(wb.sheetnames):
-        make_upper  = name.upper()
-        today_rows  = today_lots.get(make_upper, [])
-        panel_html, count = _ws_to_panel_content(wb[name], vin_to_url, today_rows)
-        safe_id = re.sub(r"\W+", "_", name)
-        active  = "active" if i == 0 else ""
+    if wb is not None:
+        for i, name in enumerate(wb.sheetnames):
+            make_upper  = name.upper()
+            today_rows  = today_lots.get(make_upper, [])
+            panel_html, count = _ws_to_panel_content(wb[name], vin_to_url, today_rows)
+            safe_id = re.sub(r"\W+", "_", name)
+            active  = "active" if i == 0 else ""
 
-        tab_btns.append(
-            f'<button class="tab-btn {active}" data-target="{safe_id}">'
-            f'{_html.escape(name)}<span class="badge">{count}</span></button>'
-        )
-        panels.append(
-            f'<div class="tab-panel {active}" id="{safe_id}">'
-            f"{panel_html}</div>"
-        )
+            tab_btns.append(
+                f'<button class="tab-btn {active}" data-target="{safe_id}">'
+                f'{_html.escape(name)}<span class="badge">{count}</span></button>'
+            )
+            panels.append(
+                f'<div class="tab-panel {active}" id="{safe_id}">'
+                f"{panel_html}</div>"
+            )
 
-    total  = sum(wb[n].max_row - 1 for n in wb.sheetnames)
-    sheets = len(wb.sheetnames)
+        total    = sum(wb[n].max_row - 1 for n in wb.sheetnames)
+        subtitle = f"{total} vehicle(s) &nbsp;·&nbsp; {len(wb.sheetnames)} make(s)"
+    else:
+        for i, make in enumerate(sorted(today_lots.keys())):
+            today_rows = today_lots[make]
+            panel_html, count = _today_only_panel_content(today_rows)
+            safe_id = re.sub(r"\W+", "_", make)
+            active  = "active" if i == 0 else ""
+
+            tab_btns.append(
+                f'<button class="tab-btn {active}" data-target="{safe_id}">'
+                f'{_html.escape(make)}<span class="badge">{count}</span></button>'
+            )
+            panels.append(
+                f'<div class="tab-panel {active}" id="{safe_id}">'
+                f"{panel_html}</div>"
+            )
+
+        total_today = sum(len(v) for v in today_lots.values())
+        subtitle    = f"{total_today} vehicle(s) &nbsp;·&nbsp; {len(today_lots)} make(s) — Today's lots only"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -911,7 +976,7 @@ def _build_html(
 <body>
 <header>
   <h1>{_html.escape(title)}</h1>
-  <span class="subtitle">{total} vehicle(s) &nbsp;·&nbsp; {sheets} make(s)</span>
+  <span class="subtitle">{subtitle}</span>
 </header>
 <div class="container">
   <div class="tab-strip">{"".join(tab_btns)}</div>
@@ -959,10 +1024,7 @@ def main() -> None:
     args = parser.parse_args()
 
     workbook_path = Path(args.workbook)
-    if not workbook_path.exists():
-        sys.exit(f"Workbook not found: {workbook_path}")
-
-    search_dir = Path(args.search_dir) if args.search_dir else workbook_path.parent
+    search_dir    = Path(args.search_dir) if args.search_dir else workbook_path.parent
 
     out_dir = Path(args.out)
     if out_dir.exists():
@@ -970,26 +1032,33 @@ def main() -> None:
     out_dir.mkdir(parents=True)
     print(f"[*] Output folder : {out_dir.resolve()}")
 
-    print(f"[*] Loading       : {workbook_path}")
-    wb = openpyxl.load_workbook(workbook_path)
+    if not workbook_path.exists():
+        print(f"[!] Workbook not found: {workbook_path} — skipping workbook conversion")
+        wb         = None
+        vin_to_url = None
+    else:
+        print(f"[*] Loading       : {workbook_path}")
+        wb         = openpyxl.load_workbook(workbook_path)
+        vins       = _collect_vins(wb)
+        cache_path = Path(args.bidfax_cache)
+        vin_to_url = None if args.no_bidfax else _lookup_bidfax_urls(
+            vins, cache_path, args.bidfax_delay, browser_port=args.browser_port
+        )
 
     (out_dir / "style.css").write_text(CSS, encoding="utf-8")
     (out_dir / "script.js").write_text(JS,  encoding="utf-8")
     print("[+] style.css  written")
     print("[+] script.js  written")
 
-    vins       = _collect_vins(wb)
-    cache_path = Path(args.bidfax_cache)
-    vin_to_url = None if args.no_bidfax else _lookup_bidfax_urls(vins, cache_path, args.bidfax_delay, browser_port=args.browser_port)
-
     print(f"[*] Loading today's lots from: {search_dir} (date: {args.today_date})")
-    today_lots = _load_today_lots(search_dir, args.today_date)
+    today_lots  = _load_today_lots(search_dir, args.today_date)
     total_today = sum(len(v) for v in today_lots.values())
     print(f"[*] Today's lots  : {total_today} across {len(today_lots)} make(s)")
 
     html_content = _build_html(wb, args.title, vin_to_url, today_lots)
     (out_dir / "index.html").write_text(html_content, encoding="utf-8")
-    print(f"[+] index.html written  ({len(wb.sheetnames)} sheet(s))")
+    sheets_info = f"{len(wb.sheetnames)} sheet(s)" if wb is not None else "today-only"
+    print(f"[+] index.html written  ({sheets_info})")
     print(f"\n[+] Done → {(out_dir / 'index.html').resolve()}")
 
 

@@ -1,0 +1,7 @@
+caches/chrome_profile_shared/
+output/copart*
+output/iaai*
+logs/*
+caches/*
+__pycache__/*
+filters/*
