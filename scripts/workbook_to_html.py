@@ -463,12 +463,15 @@ tr.no-results td {
     align-items: center;
     padding: 10px 12px;
     margin-bottom: 8px;
-    background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     box-shadow: 0 1px 3px rgba(0,0,0,.04);
   }
-  .filterable-table tbody tr:nth-child(even) { background: var(--surface); }
+  /* Zebra striping: odd cards white, even main-cards grey, even today-cards
+     green — same palette as the desktop rows. The base rules (tbody tr
+     nth-child(even), .today-table tbody tr:nth-child(even)) defined above
+     cascade in automatically now that the mobile block doesn't override them. */
+  .filterable-table tbody tr:nth-child(odd) { background: var(--surface); }
   .filterable-table tbody tr:hover { background: var(--hover); }
 
   .filterable-table tbody td {
