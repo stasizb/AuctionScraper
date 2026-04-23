@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""
+price_fix.py — Re-fetch bidfax data for specific lot numbers and overwrite
+every matching row in the output files.
+
+Some lots end up with the wrong bidfax Link / Price / VIN because the
+initial search matched a different vehicle. Give this script the affected
+lot numbers and it will:
+
+  1. Open one Chrome session on bidfax.info and search each lot.
+  2. For every lot that is found, overwrite Link / Price / VIN wherever the
+     lot appears in:
+       - output/<auction>_price_<date>.csv files   (any number of matches)
+       - output/auction_results.xlsx                (across every sheet)
+       - output/html_report/index.html              (across every table)
+
+Lots that are not found on bidfax are reported and skipped.
+
+Usage:
+    python price_fix.py --lots "44428368, 44428369, 44428360"
+    python price_fix.py --lots 44428368 --dir output
+    python price_fix.py --lots 44428368 --browser-port 9222
+"""
+
+import argparse
+import asyncio
+import csv
+import re
+import sys
+from pathlib import Path
+
+import bidfax_lib
+
+try:
+    import openpyxl
+except ImportError:
+    sys.exit("openpyxl not found. Install with:  pip install openpyxl")
+
+try:
+    from bs4 import BeautifulSoup, NavigableString
+    _BS4_OK = True
+except ImportError:
+    _BS4_OK = False
+
+try:
+    import nodriver as uc
+    _NODRIVER_OK = True
+except ImportError:
+    _NODRIVER_OK = False
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+LOT_COL   = "Lot Number"
+PRICE_COL = "Price"
+VIN_COL   = "VIN"
+LINK_COL  = "Link"
+
+PRICE_FILE_PATTERN = re.compile(
+    r"^(iaai|copart)_price_(\d{4})_(\d{2})_(\d{2})\.csv$",
+    re.IGNORECASE,
+)
+
+_BIDFAX_DOMAIN = "bidfax.info"
+
+
+# ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+
+def _parse_lots(arg: str) -> list[str]:
+    """Split '44428368, 44428369; 44428360' into ['44428368', '44428369', '44428360']."""
+    return [p.strip() for p in re.split(r"[,;]", arg) if p.strip()]
+
+
+# ---------------------------------------------------------------------------
+# Bidfax lookup
+# ---------------------------------------------------------------------------
+
+async def _lookup_lots_async(
+    lots: list[str],
+    delay: float,
+    browser_port: int | None,
+) -> dict[str, tuple[str, str, str]]:
+    """Search every lot on bidfax in one browser session.
+
+    Returns {lot: (price, vin, url)} only for lots with a bidfax result URL.
+    """
+    if browser_port:
+        browser = await uc.start(host="127.0.0.1", port=browser_port)
+    else:
+        browser = await uc.start(
+            headless=False,
+            sandbox=False,
+            browser_args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+    results: dict[str, tuple[str, str, str]] = {}
+    try:
+        page = await browser.get(bidfax_lib.BIDFAX_HOME)
+        print("[*] Waiting for bidfax.info (Cloudflare)...")
+        await bidfax_lib._wait_cf_clear(page)
+        print("[+] Ready.")
+        for i, lot in enumerate(lots, 1):
+            print(f"  [bidfax {i}/{len(lots)}] {lot!r} ... ", end="", flush=True)
+            await page.get(bidfax_lib.BIDFAX_HOME)
+            await asyncio.sleep(2)
+            await bidfax_lib._wait_cf_clear(page)
+            price, vin, url = await bidfax_lib.search_bidfax(page, lot)
+            if url:
+                results[lot] = (price, vin, url)
+                print(f"{price}  VIN:{vin or '—'}  {url}")
+            else:
+                print("not found — SKIPPED")
+            if i < len(lots):
+                await asyncio.sleep(delay)
+    finally:
+        try:
+            await browser.stop()
+        except Exception:
+            pass
+    return results
+
+
+def lookup_lots(
+    lots: list[str],
+    delay: float,
+    browser_port: int | None,
+) -> dict[str, tuple[str, str, str]]:
+    if not _NODRIVER_OK:
+        sys.exit("nodriver is required. Install with:  pip install nodriver")
+    return asyncio.run(_lookup_lots_async(lots, delay, browser_port))
+
+
+# ---------------------------------------------------------------------------
+# CSV fix
+# ---------------------------------------------------------------------------
+
+def _fix_csv_file(path: Path, results: dict[str, tuple[str, str, str]]) -> int:
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        reader     = csv.DictReader(fh)
+        fieldnames = list(reader.fieldnames or [])
+        rows       = list(reader)
+
+    changed = 0
+    for row in rows:
+        lot = str(row.get(LOT_COL, "")).strip()
+        if lot not in results:
+            continue
+        price, vin, url = results[lot]
+        row[PRICE_COL] = price
+        if vin:
+            row[VIN_COL] = vin
+        if url:
+            row[LINK_COL] = url
+        changed += 1
+
+    if changed:
+        with path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+    return changed
+
+
+def fix_csvs(directory: Path, results: dict[str, tuple[str, str, str]]) -> int:
+    print(f"[*] Scanning {directory} for price CSVs…")
+    total = files_touched = 0
+    for path in sorted(directory.glob("*.csv")):
+        if not PRICE_FILE_PATTERN.match(path.name):
+            continue
+        changed = _fix_csv_file(path, results)
+        if changed:
+            files_touched += 1
+            total         += changed
+            print(f"  [+] {path.name}: {changed} row(s) updated")
+    if total:
+        print(f"[+] CSVs: {total} row(s) across {files_touched} file(s) updated")
+    else:
+        print("[*] No matching CSV rows found.")
+    return total
+
+
+# ---------------------------------------------------------------------------
+# Workbook fix
+# ---------------------------------------------------------------------------
+
+def fix_workbook(workbook_path: Path, results: dict[str, tuple[str, str, str]]) -> int:
+    if not workbook_path.exists():
+        print(f"[*] Workbook not found: {workbook_path} — skipping")
+        return 0
+
+    wb = openpyxl.load_workbook(workbook_path)
+    total = 0
+
+    for ws in wb.worksheets:
+        headers = list(next(ws.iter_rows(min_row=1, max_row=1, values_only=True), []))
+        if LOT_COL not in headers:
+            continue
+        lot_c   = headers.index(LOT_COL)   + 1
+        price_c = headers.index(PRICE_COL) + 1 if PRICE_COL in headers else None
+        vin_c   = headers.index(VIN_COL)   + 1 if VIN_COL   in headers else None
+        link_c  = headers.index(LINK_COL)  + 1 if LINK_COL  in headers else None
+
+        sheet_updated = 0
+        for row in ws.iter_rows(min_row=2):
+            lot = str(row[lot_c - 1].value or "").strip()
+            if lot not in results:
+                continue
+            price, vin, url = results[lot]
+            if price_c:
+                row[price_c - 1].value = price
+            if vin_c and vin:
+                row[vin_c - 1].value = vin
+            if link_c and url:
+                row[link_c - 1].value = f'=HYPERLINK("{url}")'
+            sheet_updated += 1
+
+        if sheet_updated:
+            print(f"  [+] Sheet {ws.title!r}: {sheet_updated} row(s) updated")
+            total += sheet_updated
+
+    if total:
+        wb.save(workbook_path)
+        print(f"[+] Workbook saved → {workbook_path.name}  ({total} row(s))")
+    else:
+        print("[*] No matching workbook rows found.")
+    return total
+
+
+# ---------------------------------------------------------------------------
+# HTML fix
+# ---------------------------------------------------------------------------
+
+def _th_first_text(th) -> str:
+    """Return the first text node inside a <th>, ignoring nested spans (sort-icon)."""
+    for child in th.children:
+        if isinstance(child, NavigableString):
+            txt = str(child).strip()
+            if txt:
+                return txt
+    return ""
+
+
+def _set_link_cell(soup, td, url: str) -> None:
+    td.clear()
+    if _BIDFAX_DOMAIN in url:
+        td["class"] = ["cell-bidfax"]
+        label = "Bidfax"
+    else:
+        td["class"] = ["cell-link"]
+        label = "View"
+    a = soup.new_tag("a", href=url, target="_blank")
+    a.string = label
+    td.append(a)
+
+
+def _update_html_row(soup, tds, headers_idx, result: tuple[str, str, str]) -> None:
+    price, vin, url = result
+    price_i = headers_idx.get(PRICE_COL, -1)
+    vin_i   = headers_idx.get(VIN_COL,   -1)
+    link_i  = headers_idx.get(LINK_COL,  -1)
+
+    if 0 <= price_i < len(tds):
+        td = tds[price_i]
+        td.clear()
+        td["class"] = ["cell-price"]
+        td.string   = price
+    if 0 <= vin_i < len(tds) and vin:
+        td = tds[vin_i]
+        td.clear()
+        td["class"] = ["cell-vin"]
+        td.string   = vin
+    if 0 <= link_i < len(tds) and url:
+        _set_link_cell(soup, tds[link_i], url)
+
+
+def fix_html(html_path: Path, results: dict[str, tuple[str, str, str]]) -> int:
+    if not html_path.exists():
+        print(f"[*] HTML not found: {html_path} — skipping")
+        return 0
+    if not _BS4_OK:
+        print("[warn] beautifulsoup4 not installed — skipping HTML update")
+        return 0
+
+    soup  = BeautifulSoup(html_path.read_text(encoding="utf-8"), "html.parser")
+    total = 0
+
+    for table in soup.select("table.filterable-table"):
+        thead = table.find("thead")
+        tbody = table.find("tbody")
+        if not thead or not tbody:
+            continue
+
+        headers = [_th_first_text(th) for th in thead.find_all("th")]
+        if LOT_COL not in headers:
+            continue
+
+        lot_i       = headers.index(LOT_COL)
+        headers_idx = {h: i for i, h in enumerate(headers)}
+
+        for tr in tbody.find_all("tr"):
+            if "no-results" in (tr.get("class") or []):
+                continue
+            tds = tr.find_all("td")
+            if lot_i >= len(tds):
+                continue
+            lot = tds[lot_i].get_text(strip=True)
+            if lot not in results:
+                continue
+            _update_html_row(soup, tds, headers_idx, results[lot])
+            total += 1
+
+    if total:
+        html_path.write_text(str(soup), encoding="utf-8")
+        print(f"[+] HTML: {total} row(s) updated → {html_path.name}")
+    else:
+        print("[*] No matching HTML rows found.")
+    return total
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Re-fetch bidfax data for specific lot numbers and overwrite matching rows in output files.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--lots", required=True,
+                        help='Comma- or semicolon-separated lot numbers, e.g. "44428368, 44428369"')
+    parser.add_argument("--dir",      "-d", default="output",
+                        help="Directory containing price CSVs (default: output)")
+    parser.add_argument("--workbook", "-w", default=None,
+                        help="Excel workbook path (default: <dir>/auction_results.xlsx)")
+    parser.add_argument("--html",           default=None,
+                        help="HTML report path (default: <dir>/html_report/index.html)")
+    parser.add_argument("--delay",          default=2.0, type=float,
+                        help="Seconds between bidfax searches (default: 2.0)")
+    parser.add_argument("--browser-port",   type=int, default=None,
+                        help="Connect to a running Chrome on this port instead of launching one")
+    args = parser.parse_args()
+
+    lots = _parse_lots(args.lots)
+    if not lots:
+        sys.exit("--lots is empty")
+
+    work_dir      = Path(args.dir).resolve()
+    workbook_path = Path(args.workbook).resolve() if args.workbook else work_dir / "auction_results.xlsx"
+    html_path     = Path(args.html).resolve()     if args.html     else work_dir / "html_report" / "index.html"
+
+    print(f"Lots     : {lots}")
+    print(f"Dir      : {work_dir}")
+    print(f"Workbook : {workbook_path}")
+    print(f"HTML     : {html_path}")
+    print(f"Delay    : {args.delay}s\n")
+
+    results = lookup_lots(lots, args.delay, args.browser_port)
+
+    missing = [l for l in lots if l not in results]
+    if missing:
+        print(f"\n[*] {len(missing)} lot(s) skipped (not found on bidfax): {', '.join(missing)}")
+    if not results:
+        print("[!] No lots found on bidfax — nothing to fix.")
+        return
+
+    print(f"\n[*] {len(results)} lot(s) resolved — fixing output files")
+
+    print("\n— CSVs —")
+    fix_csvs(work_dir, results)
+
+    print("\n— Workbook —")
+    fix_workbook(workbook_path, results)
+
+    print("\n— HTML —")
+    fix_html(html_path, results)
+
+    print("\n[+] Done.")
+
+
+if __name__ == "__main__":
+    main()
