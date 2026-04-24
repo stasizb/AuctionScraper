@@ -126,6 +126,24 @@ class TestFakeIAAIClient(unittest.TestCase):
         self.assertEqual(OUTPUT_FIELDS[:6],
                          ["Make", "Model", "Year", "Odometer", "Fuel Type", "Lot Number"])
 
+    def test_scrape_many_iterates_all_filter_rows(self):
+        c = FakeIAAIClient(scrape_fn=lambda f: [{"make": f.get("make")}])
+        out = c.scrape_many([{"make": "HONDA"}, {"make": "AUDI"}, {"make": "BMW"}])
+        self.assertEqual([r["make"] for r in out], ["HONDA", "AUDI", "BMW"])
+        self.assertEqual(len(c.calls), 3)
+
+    def test_scrape_many_empty_list(self):
+        c = FakeIAAIClient(rows=[{"x": 1}])
+        self.assertEqual(c.scrape_many([]), [])
+        self.assertEqual(c.calls, [])
+
+    def test_scrape_with_filters_delegates_to_scrape_many_in_fake(self):
+        # Both entry points must produce the same rows — tests shouldn't care
+        # which one they use, and scripts can call either.
+        c = FakeIAAIClient(rows=[{"Lot Number": "x"}])
+        self.assertEqual(c.scrape_with_filters({"make": "HONDA"}),
+                         c.scrape_many([{"make": "HONDA"}]))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -455,14 +455,26 @@ async def _search_once(page, query: str) -> tuple[str, str, str]:
 
 async def _query_with_retries(page, query: str, expected_make: str) -> tuple[str, str, str]:
     """Run one bidfax search with up to 3 retries when the URL's make doesn't
-    match `expected_make` (guards against bidfax returning a wrong vehicle).
+    match `expected_make` (guards against bidfax returning a wrong vehicle —
+    e.g. asking for Audi Q5 lot 41613606 but bidfax's top hit is a Nissan
+    Leaf with the same digits somewhere in its listing).
+
+    If every retry comes back with a mismatched make, we treat the lot as
+    not-found and return (IN_PROGRESS, "", "") rather than hand back data
+    that belongs to a different vehicle. When `expected_make` is empty
+    (e.g. VIN lookups), the first URL is accepted without validation.
     """
-    price, vin, url = IN_PROGRESS, "", ""
     for _ in range(3):
         await page.get(BIDFAX_HOME)
         await asyncio.sleep(2)
         await _wait_cf_clear(page)
         price, vin, url = await _search_once(page, query)
-        if not url or not expected_make or url_make_matches(expected_make, url):
+        if not url:
+            # bidfax returned no result — truly not found, surface that.
+            return IN_PROGRESS, "", ""
+        if not expected_make or url_make_matches(expected_make, url):
             return price, vin, url
-    return price, vin, url
+        print(f"    [bidfax] make mismatch for {query!r}: "
+              f"expected {expected_make!r}, got URL {url}", flush=True)
+    # All retries returned URLs with the wrong make — refuse to use them.
+    return IN_PROGRESS, "", ""

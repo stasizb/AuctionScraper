@@ -30,7 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from clients import bidfax
-from core.columns  import LINK_COL, LOT_COL, PRICE_COL, VIN_COL
+from core.columns  import LINK_COL, LOT_COL, MAKE_COL, PRICE_COL, VIN_COL
 from core.csv_io   import PRICE_FILE_PATTERN, load_csv_dict, save_csv_dict
 from core.workbook import apply_result_to_row, resolve_columns
 
@@ -62,16 +62,48 @@ def _parse_lots(arg: str) -> list[str]:
 # Bidfax lookup
 # ---------------------------------------------------------------------------
 
+def find_makes_for_lots(directory: Path, lots: list[str]) -> dict[str, str]:
+    """Scan existing price CSVs in `directory` for each lot's Make.
+
+    The make is needed for bidfax URL-make validation — without it, bidfax can
+    return a totally different vehicle (e.g. Audi Q5 lot 41613606 silently
+    pulled a Nissan Leaf result) and we'd happily overwrite the CSVs with it.
+    Returns {lot: make_uppercase}; lots not found in any CSV are omitted.
+    """
+    wanted  = set(lots)
+    makes: dict[str, str] = {}
+    for path in sorted(directory.glob("*.csv")):
+        if not PRICE_FILE_PATTERN.match(path.name) or not wanted:
+            continue
+        _fields, rows = load_csv_dict(path)
+        for row in rows:
+            lot = str(row.get(LOT_COL, "")).strip()
+            if lot in wanted and not makes.get(lot):
+                make = str(row.get(MAKE_COL, "")).strip()
+                if make:
+                    makes[lot] = make
+        wanted -= set(makes)
+    return makes
+
+
 def lookup_lots(
     lots: list[str],
     delay: float,
     browser_port: int | None,
     client: bidfax.BidfaxClient | None = None,
     max_concurrent: int = 1,
+    makes: dict[str, str] | None = None,
 ) -> dict[str, tuple[str, str, str]]:
-    """Re-fetch bidfax data for each lot. Returns only lots with a result URL."""
+    """Re-fetch bidfax data for each lot. Returns only lots with a result URL.
+
+    `makes` supplies the expected Make for URL validation; when the first
+    bidfax hit belongs to a different make the client now returns
+    IN_PROGRESS (treated as not-found here) rather than polluting the CSVs.
+    """
     real_client = client or bidfax.BrowserBidfaxClient(browser_port=browser_port)
-    fetched     = real_client.lookup_many(lots, delay=delay, max_concurrent=max_concurrent)
+    fetched     = real_client.lookup_many(
+        lots, makes=makes, delay=delay, max_concurrent=max_concurrent,
+    )
     results: dict[str, tuple[str, str, str]] = {}
     for lot in lots:
         price, vin, url = fetched.get(lot, (bidfax.IN_PROGRESS, "", ""))
@@ -294,8 +326,18 @@ def main() -> None:
     print(f"HTML     : {html_path}")
     print(f"Delay    : {args.delay}s\n")
 
+    # Resolve each lot's Make from existing CSVs so bidfax make-validation
+    # can reject wrong-vehicle hits (e.g. a Q5 query surfacing a Nissan Leaf).
+    makes = find_makes_for_lots(work_dir, lots)
+    without_make = [lot for lot in lots if lot not in makes]
+    if makes:
+        print(f"[*] Resolved Make for {len(makes)}/{len(lots)} lot(s) from CSVs")
+    if without_make:
+        print(f"[*] No Make found in CSVs for: {', '.join(without_make)} "
+              f"— bidfax will accept whatever it returns for these")
+
     results = lookup_lots(lots, args.delay, args.browser_port,
-                          max_concurrent=args.concurrent)
+                          max_concurrent=args.concurrent, makes=makes)
 
     missing = [l for l in lots if l not in results]
     if missing:

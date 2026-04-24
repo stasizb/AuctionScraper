@@ -33,6 +33,7 @@ USAGE:
 """
 
 import argparse
+import os
 import socket
 import subprocess
 import sys
@@ -44,6 +45,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core.chrome import find_chrome
+
+# Child Python processes write to pipes in `run_parallel`. Block-buffered
+# stdout means the user sees nothing until the subprocess exits — which
+# looked like "IAAI didn't start" when it was actually just running
+# silently behind buffers. Force line-buffered mode globally.
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
 
 def _free_port() -> int:
@@ -141,31 +148,54 @@ def run(step_name: str, cmd: list[str]) -> None:
     _record(step_name, "ok")
 
 
-def run_parallel(steps: list[tuple[str, list[str]]]) -> None:
-    """Run steps concurrently; print each step's output atomically on completion.
+def _prefix_for(name: str) -> str:
+    """Short tag like '[1]' derived from the leading step number in a name."""
+    head = name.split(" ", 1)[0].rstrip(".")
+    return f"[{head}] "
 
-    Each step's stdout/stderr is buffered so output from different steps is never
-    interleaved. All steps are awaited before returning. Exits if any step fails.
+
+def run_parallel(steps: list[tuple[str, list[str]]]) -> None:
+    """Run steps concurrently and stream their output live.
+
+    Each child's stdout (stderr merged in) is read line-by-line and prefixed
+    with the step's leading tag (e.g. `[1]`, `[2]`). Lines from different
+    steps may interleave but the prefix keeps them attributable, and the
+    user sees progress immediately instead of after the subprocess exits.
+    Exits if any step fails.
     """
     _lock    = threading.Lock()
     failures: list[tuple[str, int]] = []
 
     def _run_one(name: str, cmd: list[str]) -> None:
-        header = (
-            f"\n{'=' * 60}\n[STEP] {name} [parallel]\n{'=' * 60}\n"
-            f"  cmd: {' '.join(cmd)}\n\n"
-        )
-        proc   = subprocess.run(cmd, capture_output=True, text=True)
-        footer = (
-            f"\n[OK] {name}\n"
-            if proc.returncode == 0
-            else f"\n[FAIL] {name} exited with code {proc.returncode}\n"
-        )
+        prefix = _prefix_for(name)
         with _lock:
-            print(header + (proc.stdout or "") + (proc.stderr or "") + footer, flush=True)
+            print(f"\n{'=' * 60}", flush=True)
+            print(f"[STEP] {name} [parallel]",  flush=True)
+            print(f"{'=' * 60}",                flush=True)
+            print(f"  cmd: {' '.join(cmd)}\n",  flush=True)
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # merge so stderr stays in-order with stdout
+            text=True,
+            bufsize=1,                 # line-buffered
+        )
+        try:
+            for line in proc.stdout:
+                with _lock:
+                    print(prefix + line, end="", flush=True)
+        finally:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        proc.wait()
+
+        with _lock:
             if proc.returncode == 0:
+                print(f"\n[OK] {name}", flush=True)
                 _record(name, "ok")
             else:
+                print(f"\n[FAIL] {name} exited with code {proc.returncode}", flush=True)
                 _record(name, "fail", f"exit {proc.returncode}")
                 failures.append((name, proc.returncode))
 

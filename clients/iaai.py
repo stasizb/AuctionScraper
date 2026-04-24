@@ -164,11 +164,13 @@ def _parse_scraped_row(r: dict) -> dict | None:
 
 def apply_equipment_postfilter(page_records: list, equipment: str) -> list:
     if not equipment:
+        print(f"        -> {len(page_records)} raw vehicle(s) found on page", flush=True)
         return page_records
-    kept = []
-    for rec in page_records:
-        if equipment_matches(rec.get("_full_title", ""), equipment):
-            kept.append(rec)
+    kept = [r for r in page_records
+            if equipment_matches(r.get("_full_title", ""), equipment)]
+    dropped = len(page_records) - len(kept)
+    print(f"        -> {len(page_records)} raw / {dropped} dropped by "
+          f"equipment filter / {len(kept)} kept", flush=True)
     return kept
 
 
@@ -178,13 +180,16 @@ def apply_equipment_postfilter(page_records: list, equipment: str) -> list:
 
 @runtime_checkable
 class IAAIClient(Protocol):
-    """Everything scripts need from iaai.com."""
+    """Everything scripts need from iaai.com. The main entry is `scrape_many`
+    — it owns the full browser lifecycle so every query runs under the same
+    asyncio event loop (nodriver objects can't cross loops)."""
 
-    def __enter__(self) -> "IAAIClient": ...
-    def __exit__(self, exc_type, exc, tb) -> None: ...
+    def scrape_many(self, filter_rows: list[dict]) -> list[dict]:
+        """Open browser once, apply each filter set in turn, return all rows."""
 
+    # Kept for ad-hoc single-filter use (tests, REPL). Defaults to scrape_many.
     def scrape_with_filters(self, filters: dict, clear_filters: bool = False) -> list[dict]:
-        """Apply `filters`, walk every result page, return OUTPUT_FIELDS dicts."""
+        return self.scrape_many([filters])
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +197,12 @@ class IAAIClient(Protocol):
 # ---------------------------------------------------------------------------
 
 class BrowserIAAIClient:
-    """Live iaai.com client backed by a real Chrome session (via nodriver)."""
+    """Live iaai.com client backed by a real Chrome session (via nodriver).
+
+    Every public method manages its own browser lifecycle inside a single
+    asyncio.run() — nodriver objects are loop-scoped, so reusing them
+    across asyncio.run invocations would crash (see BrowserBidfaxClient
+    for the same pattern)."""
 
     def __init__(
         self,
@@ -203,57 +213,77 @@ class BrowserIAAIClient:
             raise RuntimeError("nodriver is required. Install with:  pip install nodriver")
         self._browser_port = browser_port
         self._profile_dir  = profile_dir
-        self._browser      = None
-        self._chrome_proc  = None
-        self._page         = None
-        self._has_run      = False
 
-    # ---- Context manager ---------------------------------------------------
+    # ---- Public interface --------------------------------------------------
 
-    def __enter__(self) -> "BrowserIAAIClient":
-        asyncio.run(self._start())
-        return self
+    def scrape_many(self, filter_rows: list[dict]) -> list[dict]:
+        if not filter_rows:
+            return []
+        return asyncio.run(self._scrape_many_async(filter_rows))
 
-    def __exit__(self, exc_type, exc, tb) -> None:
-        asyncio.run(self._stop())
+    def scrape_with_filters(self, filters: dict, clear_filters: bool = False) -> list[dict]:
+        del clear_filters  # scrape_many handles clearing between filter sets
+        return self.scrape_many([filters])
 
-    async def _start(self) -> None:
+    # ---- Async internals ---------------------------------------------------
+
+    async def _start_browser(self):
+        """Start Chrome (or attach). Returns (browser, chrome_proc | None)."""
         if self._browser_port:
-            self._browser = await asyncio.wait_for(
+            print(f"[iaai] attaching to shared Chrome on port {self._browser_port}…",
+                  flush=True)
+            browser = await asyncio.wait_for(
                 uc.start(host="127.0.0.1", port=self._browser_port),
                 timeout=30.0,
             )
-        else:
-            port = _free_port()
-            self._chrome_proc = await _start_chrome(port, self._profile_dir or "caches/chrome_profile_iaai")
-            self._browser = await asyncio.wait_for(
-                uc.start(host="127.0.0.1", port=port),
-                timeout=30.0,
-            )
-        self._page = await asyncio.wait_for(
-            self._browser.get(IAAI_SEARCH_URL), timeout=30.0,
+            print("[iaai] nodriver attached.", flush=True)
+            return browser, None
+        port = _free_port()
+        print(f"[iaai] launching Chrome on port {port} (profile={self._profile_dir})…",
+              flush=True)
+        chrome_proc = await _start_chrome(
+            port, self._profile_dir or "caches/chrome_profile_iaai",
         )
-        await asyncio.sleep(WAIT_LONG)
+        browser = await asyncio.wait_for(
+            uc.start(host="127.0.0.1", port=port), timeout=30.0,
+        )
+        print("[iaai] Chrome + nodriver ready.", flush=True)
+        return browser, chrome_proc
 
-    async def _stop(self) -> None:
-        if self._chrome_proc:
-            try:
-                await asyncio.wait_for(self._browser.stop(), timeout=5.0)
-            except Exception:
-                pass
-            self._chrome_proc.terminate()
+    async def _stop_browser(self, browser, chrome_proc) -> None:
+        if chrome_proc is None:
+            return
+        try:
+            await asyncio.wait_for(browser.stop(), timeout=5.0)
+        except Exception:
+            pass
+        chrome_proc.terminate()
 
-    # ---- Public method ------------------------------------------------------
+    async def _scrape_many_async(self, filter_rows: list[dict]) -> list[dict]:
+        print(f"[iaai] scrape_many: {len(filter_rows)} filter set(s)", flush=True)
+        browser, chrome_proc = await self._start_browser()
+        try:
+            print(f"[iaai] opening {IAAI_SEARCH_URL} …", flush=True)
+            page = await asyncio.wait_for(browser.get(IAAI_SEARCH_URL), timeout=30.0)
+            await asyncio.sleep(WAIT_LONG)
+            print("[iaai] IAAI Search page loaded.", flush=True)
 
-    def scrape_with_filters(self, filters: dict, clear_filters: bool = False) -> list[dict]:
-        # IAAI requires clearing filters on the 2nd+ call in one session
-        if not clear_filters and self._has_run:
-            clear_filters = True
-        self._has_run = True
-        return asyncio.run(self._scrape_async(filters, clear_filters))
+            all_records: list[dict] = []
+            for idx, filters in enumerate(filter_rows, 1):
+                print(f"\n[*] Filter set {idx}/{len(filter_rows)}")
+                try:
+                    records = await self._scrape_one(page, filters, clear_filters=(idx > 1))
+                    all_records.extend(records)
+                except Exception as exc:
+                    print(f"[!] Error on filter set {idx}: {exc}")
+                    import traceback
+                    traceback.print_exc()
+                    await asyncio.sleep(3)
+            return all_records
+        finally:
+            await self._stop_browser(browser, chrome_proc)
 
-    async def _scrape_async(self, filters: dict, clear_filters: bool) -> list[dict]:
-        page = self._page
+    async def _scrape_one(self, page, filters: dict, clear_filters: bool) -> list[dict]:
         await page.get(IAAI_SEARCH_URL)
         await asyncio.sleep(WAIT_LONG)
 
@@ -268,10 +298,19 @@ class BrowserIAAIClient:
         fuel_type = str(filters.get("fuel_type", "")).strip()
         equipment = str(filters.get("equipment", "")).strip()
 
+        print(f"[iaai] Filters -> Make={make!r}, Models={models}, "
+              f"Year={year_min}-{year_max}, Odo<={odo_max}, "
+              f"Fuel={fuel_type!r}, Equipment={equipment!r}", flush=True)
+
         await _apply_featured_filter(page, "Run & Drive")
         await _apply_featured_filter(page, "Auction Today")
         await _apply_year_filter(page, year_min, year_max)
-        await _apply_make_filter(page, make)
+        if not await _apply_make_filter(page, make):
+            # Make not in today's filter panel — IAAI has no lots of this
+            # make today, so model/fuel checks would all fail. Skip to save time.
+            print("    [iaai] [!] Skipping scrape — make not in today's list.",
+                  flush=True)
+            return []
         if not await _apply_model_filters(page, models):
             return []
         await _apply_fuel_type_filter(page, fuel_type)
@@ -281,7 +320,9 @@ class BrowserIAAIClient:
         all_records: list[dict] = []
         page_num    = 1
         total_pages = await _get_total_pages(page)
+        print(f"    [iaai] Total pages detected: {total_pages}", flush=True)
         while True:
+            print(f"    [iaai] Scraping page {page_num}/{total_pages} …", flush=True)
             page_records = await _scrape_current_page(page)
             all_records.extend(apply_equipment_postfilter(page_records, equipment))
             if page_num >= total_pages:
@@ -289,6 +330,7 @@ class BrowserIAAIClient:
             if not await _go_to_next_page(page):
                 break
             page_num += 1
+        print(f"    [iaai] Kept for this filter set: {len(all_records)}", flush=True)
         return all_records
 
 
@@ -313,15 +355,17 @@ class FakeIAAIClient:
         self._scrape_fn = scrape_fn
         self.calls: list[dict] = []
 
-    def __enter__(self) -> "FakeIAAIClient":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        # Fake has no browser to tear down; context manager is for API parity.
-        return None
+    def scrape_many(self, filter_rows: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for filters in filter_rows:
+            out.extend(self._scrape_one(filters))
+        return out
 
     def scrape_with_filters(self, filters: dict, clear_filters: bool = False) -> list[dict]:
-        del clear_filters  # accepted for protocol compatibility; fake has no UI state
+        del clear_filters  # fake has no UI state
+        return self._scrape_one(filters)
+
+    def _scrape_one(self, filters: dict) -> list[dict]:
         self.calls.append(dict(filters))
         if self._scrape_fn is not None:
             return list(self._scrape_fn(filters))
@@ -393,7 +437,10 @@ async def _clear_all_filters(page) -> bool:
     """
     ok = await page.evaluate(js)
     if ok:
+        print("    [iaai] Cleared all previous filters", flush=True)
         await asyncio.sleep(WAIT_MEDIUM * 1.5)
+    else:
+        print("    [iaai] No active filters to clear", flush=True)
     return bool(ok)
 
 
@@ -466,6 +513,10 @@ async def _apply_featured_filter(page, filter_id: str) -> bool:
     }})();
     """
     ok = await page.evaluate(js)
+    if ok:
+        print(f"    [iaai] Clicked featured filter: {filter_id}", flush=True)
+    else:
+        print(f"    [iaai] [warn] Featured filter button not found: {filter_id}", flush=True)
     await asyncio.sleep(WAIT_SHORT)
     return bool(ok)
 
@@ -475,6 +526,7 @@ async def _apply_year_filter(page, year_min, year_max) -> None:
     year_max = str(year_max) if year_max else ""
     if not year_min and not year_max:
         return
+    print(f"    [iaai] Setting Year: {year_min} - {year_max}", flush=True)
     if year_min:
         await _set_input_value(page, "YearFilterFrom", year_min)
         await asyncio.sleep(0.3)
@@ -498,6 +550,7 @@ async def _apply_odometer_filter(page, odo_max) -> None:
     odo_max = str(odo_max) if odo_max else ""
     if not odo_max:
         return
+    print(f"    [iaai] Setting Odometer max: {odo_max}", flush=True)
     await _set_input_value(page, "ODOValueFilterTo", odo_max)
     await asyncio.sleep(0.3)
     js = """
@@ -513,21 +566,44 @@ async def _apply_odometer_filter(page, odo_max) -> None:
     await asyncio.sleep(WAIT_MEDIUM)
 
 
-async def _apply_make_filter(page, make: str) -> None:
+async def _apply_make_filter(page, make: str) -> bool:
+    """Returns True if the Make checkbox was found and clicked (or unset)."""
     if not make:
-        return
+        return True
+    print(f"    [iaai] Setting Make: {make}", flush=True)
     await _type_in_filter_search(page, "make", make)
     await asyncio.sleep(WAIT_SHORT)
-    await _click_checkbox_by_name(page, make)
+    ok = await _click_checkbox_by_name(page, make)
+    if not ok:
+        print(f"    [iaai] [warn] Make checkbox not found: {make}", flush=True)
     await asyncio.sleep(WAIT_MEDIUM)
+    return bool(ok)
 
 
 async def _apply_model_filter(page, model: str) -> bool:
+    """Click the IAAI Model checkbox.
+
+    `_click_checkbox_by_name` matches by checkbox `name` using substring, so
+    multi-word models like 'GLE 350' fail when IAAI only lists 'GLE'. Fall
+    back to the first word of the model — the caller's Equipment post-filter
+    narrows trims (e.g. Equipment='350 4MATIC' catches exactly that trim).
+    """
     if not model:
         return True
+    print(f"    [iaai] Setting Model: {model}", flush=True)
     await _type_in_filter_search(page, "model", model)
     await asyncio.sleep(WAIT_SHORT)
     ok = await _click_checkbox_by_name(page, model)
+
+    first = model.split(" ", 1)[0] if " " in model else ""
+    if not ok and first and first != model:
+        print(f"    [iaai] Model '{model}' not found — retrying with '{first}'", flush=True)
+        await _type_in_filter_search(page, "model", first)
+        await asyncio.sleep(WAIT_SHORT)
+        ok = await _click_checkbox_by_name(page, first)
+
+    if not ok:
+        print(f"    [iaai] [warn] Model checkbox not found: {model}", flush=True)
     await asyncio.sleep(WAIT_MEDIUM)
     return bool(ok)
 
@@ -535,7 +611,10 @@ async def _apply_model_filter(page, model: str) -> bool:
 async def _apply_fuel_type_filter(page, fuel_type: str) -> None:
     if not fuel_type:
         return
-    await _click_checkbox_by_name(page, fuel_type)
+    print(f"    [iaai] Setting Fuel Type: {fuel_type}", flush=True)
+    ok = await _click_checkbox_by_name(page, fuel_type)
+    if not ok:
+        print(f"    [iaai] [warn] Fuel Type checkbox not found: {fuel_type}", flush=True)
     await asyncio.sleep(WAIT_MEDIUM)
 
 
@@ -545,7 +624,10 @@ async def _apply_model_filters(page, models: list) -> bool:
         ok = await _apply_model_filter(page, m)
         if ok:
             applied.append(m)
+        else:
+            print(f"    [iaai] [!] Model '{m}' not found on site — skipping it.", flush=True)
     if models and not applied:
+        print("    [iaai] [!] No requested models available — skipping scrape.", flush=True)
         return False
     return True
 

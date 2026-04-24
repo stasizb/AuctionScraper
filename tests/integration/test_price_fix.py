@@ -147,6 +147,36 @@ class TestPriceFix(unittest.TestCase):
         self.assertEqual(price_fix.fix_workbook(self.workbook_path, results), 0)
         self.assertEqual(price_fix.fix_html(self.html_path, results), 0)
 
+    def test_find_makes_for_lots_resolves_from_csvs(self):
+        """Regression: price_fix must surface the Make of each requested lot
+        so bidfax make-validation can reject wrong-vehicle hits."""
+        makes = price_fix.find_makes_for_lots(
+            self.work_dir, ["11111111", "22222222", "33333333", "99999999"],
+        )
+        self.assertEqual(makes.get("11111111"), "HONDA")
+        self.assertEqual(makes.get("22222222"), "HONDA")
+        self.assertEqual(makes.get("33333333"), "AUDI")
+        self.assertNotIn("99999999", makes)  # lot isn't in the CSV
+
+    def test_lookup_lots_passes_makes_for_validation(self):
+        """The fake bidfax client must receive the makes mapping so the
+        real BrowserBidfaxClient's make validation kicks in on live runs."""
+
+        seen_makes: dict[str, str] = {}
+
+        class RecordingFake:
+            def lookup_many(self, queries, makes=None, delay=2.0, max_concurrent=1):
+                if makes:
+                    seen_makes.update(makes)
+                return {q: ("$100", "VIN", f"https://bidfax.info/audi/q5/{q}.html")
+                        for q in queries}
+
+        price_fix.lookup_lots(
+            ["33333333"], delay=0, browser_port=None,
+            client=RecordingFake(), makes={"33333333": "AUDI"},
+        )
+        self.assertEqual(seen_makes, {"33333333": "AUDI"})
+
 
 if __name__ == "__main__":
     unittest.main()

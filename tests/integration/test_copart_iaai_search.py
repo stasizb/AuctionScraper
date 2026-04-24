@@ -85,6 +85,33 @@ class TestIaaiSearch(unittest.TestCase):
                 rows = list(csv.DictReader(fh))
             self.assertEqual({r["Make"] for r in rows}, {"HONDA", "AUDI"})
 
+    def test_process_calls_scrape_many_once(self):
+        """Regression: scrape_many owns the browser lifecycle and must be
+        called once with the full list of filter rows — not scrape_with_filters
+        per row. The old per-row path crashed with 'NoneType' has no 'get'
+        because the real browser never initialized before the first scrape."""
+        calls = {"many": 0, "with_filters": 0}
+
+        class SpyClient:
+            def scrape_many(self, filter_rows):
+                calls["many"] += 1
+                return [{"Make": f.get("make"), "Link": "https://x", "Lot Number": "1"}
+                        for f in filter_rows]
+
+            def scrape_with_filters(self, filters, clear_filters=False):
+                calls["with_filters"] += 1
+                return []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            inp = Path(tmp) / "f.csv"
+            out = Path(tmp) / "o.csv"
+            inp.write_text("Make: HONDA, Model: CR-V\nMake: AUDI, Model: Q5\n")
+
+            iaai_search.process(str(inp), str(out), client=SpyClient())
+
+        self.assertEqual(calls["many"],         1)
+        self.assertEqual(calls["with_filters"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -32,36 +32,27 @@ def process(
     client: iaai_client.IAAIClient | None = None,
 ) -> None:
     """Run the full IAAI scrape pipeline. `client` may be injected for tests."""
-    print(f"[*] Reading filters from: {input_path}")
+    # Heartbeat so the orchestrator sees this subprocess started, even before
+    # the browser attach (which is the most likely place to hang silently).
+    print(f"[*] iaai_search.process starting (browser_port={browser_port}, "
+          f"profile_dir={profile_dir})", flush=True)
+    print(f"[*] Reading filters from: {input_path}", flush=True)
     filter_rows = iaai_client.read_filters_csv(input_path)
     if not filter_rows:
-        print("[!] No filter rows found in input CSV. Exiting.")
+        print("[!] No filter rows found in input CSV. Exiting.", flush=True)
         return
-    print(f"[*] {len(filter_rows)} filter set(s) to process.")
+    print(f"[*] {len(filter_rows)} filter set(s) to process.", flush=True)
 
     real_client = client or iaai_client.BrowserIAAIClient(
         browser_port=browser_port, profile_dir=profile_dir,
     )
 
-    all_results: list[dict] = []
-    try:
-        for idx, filters in enumerate(filter_rows, 1):
-            print(f"\n{'='*60}")
-            print(f"[*] Filter set {idx}/{len(filter_rows)}")
-            try:
-                records = real_client.scrape_with_filters(filters, clear_filters=(idx > 1))
-                all_results.extend(records)
-            except Exception as exc:
-                print(f"[!] Error on filter set {idx}: {exc}")
-                import traceback
-                traceback.print_exc()
-    finally:
-        # BrowserIAAIClient has its own teardown; fakes no-op.
-        if hasattr(real_client, "_stop"):
-            pass  # cleanup happens if the client is a context manager elsewhere
+    # scrape_many owns the browser lifecycle + per-filter error handling,
+    # so a crash in one filter set doesn't lose the rest.
+    all_results = real_client.scrape_many(filter_rows)
 
     iaai_client.write_output_csv(output_path, all_results)
-    print(f"\n[+] Done. Total vehicles saved: {len(all_results)}")
+    print(f"\n[+] Done. Total vehicles saved: {len(all_results)}", flush=True)
 
 
 def cli() -> None:
