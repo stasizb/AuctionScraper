@@ -88,6 +88,35 @@ class TestWorkbookToHtml(unittest.TestCase):
         # today's lot numbers from the fixture
         self.assertIn("11111111", html)
 
+    def test_make_only_in_today_lots_gets_its_own_tab(self):
+        """A Make freshly added to filters/ shows up in today's CSV but not
+        yet in the workbook (no priced lots). It must still render a tab/panel
+        — otherwise the user can't see today's new-make auctions until the
+        next pricing pass runs."""
+        # The fixture CSV has rows for HONDA + AUDI; only HONDA exists in the
+        # test workbook. AUDI is the "new make" the workbook hasn't seen yet.
+        shutil.copy(CSV_FIXTURES / "copart_search_2026_01_02.csv", self.work_dir)
+        html = self._generate(client=FakeBidfaxClient(),
+                              search_dir=self.work_dir, today_date="2026_01_02")
+        # Tab present for the new make
+        self.assertIn('data-target="AUDI"', html)
+        self.assertIn(">AUDI<", html)
+        # Panel exists with today's AUDI lot rendered as a today-only block
+        self.assertIn('id="AUDI"', html)
+        self.assertIn("33333333", html)  # AUDI Q5 lot from the fixture
+        # Subtitle reflects the new make in the count (workbook had 1 make)
+        self.assertIn("2 make(s)", html)
+
+        # The new-make panel must look like the green "Today's Auctions"
+        # section, not the blue main grid (regression: old code emitted only
+        # main-table class so the rendered table inherited the blue header).
+        audi_start = html.find('id="AUDI"')
+        next_panel = html.find('class="tab-panel', audi_start + 1)
+        audi_panel = html[audi_start: next_panel if next_panel != -1 else len(html)]
+        self.assertIn("today-section",        audi_panel)
+        self.assertIn("Today's Auctions",     audi_panel)
+        self.assertIn("today-table",          audi_panel)
+
     def test_summary_section_rendered(self):
         html = self._generate(client=FakeBidfaxClient())
         self.assertIn("Summary by Model", html)

@@ -1062,7 +1062,14 @@ def _model_key(model: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _today_only_panel_content(today_rows: list[dict]) -> tuple[str, int]:
-    """Build panel content from today's CSV lots when no workbook is present."""
+    """Build a panel containing only today's-auction rows.
+
+    Used for makes that have no workbook sheet yet (freshly added to filters/),
+    and as the sole content when the whole workbook is missing. The grid is
+    styled as the green 'Today's Auctions' section because every row in it is
+    a today-auction lot — there's no historical priced data to put under a
+    blue main grid.
+    """
     if not today_rows:
         return "<p>No data.</p>", 0
 
@@ -1093,14 +1100,24 @@ def _today_only_panel_content(today_rows: list[dict]) -> tuple[str, int]:
     tbody = f"<tbody>{''.join(parts)}</tbody>"
 
     table = (
-        f'<table class="filterable-table main-table">'
+        f'<table class="filterable-table main-table today-table">'
         f"{_colgroup_html(headers)}"
         f"{_thead_html(headers)}"
         f"{tbody}"
         f"</table>"
     )
 
-    content = filter_html + f'<div class="table-wrap">{table}</div>'
+    today_section = (
+        '<div class="today-section">'
+        '<div class="today-section-header">'
+        f'<h3>Today\'s Auctions</h3>'
+        f'<span class="today-badge">{len(today_rows)}</span>'
+        "</div>"
+        f'<div class="table-wrap">{table}</div>'
+        "</div>"
+    )
+
+    content = filter_html + today_section
     return content, len(today_rows)
 
 
@@ -1212,8 +1229,27 @@ def _build_html(
                 f"{panel_html}</div>"
             )
 
-        total    = sum(wb[n].max_row - 1 for n in wb.sheetnames)
-        subtitle = f"{total} vehicle(s) &nbsp;·&nbsp; {len(wb.sheetnames)} make(s)"
+        # Makes that appear in today's auction CSV but not yet in the workbook
+        # (e.g. a Make freshly added to filters/, no priced lots yet) would
+        # otherwise have no tab. Render them as today-only panels so users
+        # can see the new lots immediately, before any pricing pass runs.
+        sheet_makes_upper = {n.upper() for n in wb.sheetnames}
+        new_makes = sorted(m for m in today_lots if m not in sheet_makes_upper)
+        for make in new_makes:
+            today_rows = today_lots[make]
+            panel_html, count = _today_only_panel_content(today_rows)
+            safe_id = re.sub(r"\W+", "_", make)
+            tab_btns.append(
+                f'<button class="tab-btn" data-target="{safe_id}">'
+                f'{_html.escape(make)}<span class="badge">{count}</span></button>'
+            )
+            panels.append(
+                f'<div class="tab-panel" id="{safe_id}">{panel_html}</div>'
+            )
+
+        total      = sum(wb[n].max_row - 1 for n in wb.sheetnames)
+        make_count = len(wb.sheetnames) + len(new_makes)
+        subtitle   = f"{total} vehicle(s) &nbsp;·&nbsp; {make_count} make(s)"
     else:
         for i, make in enumerate(sorted(today_lots.keys())):
             today_rows = today_lots[make]
