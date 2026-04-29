@@ -224,11 +224,14 @@ class BrowserBidfaxClient:
         self, browser, queries: list[str], makes: dict[str, str], delay: float,
     ) -> dict[str, tuple[str, str, str]]:
         results: dict[str, tuple] = {}
-        page = await browser.get(BIDFAX_HOME)
+        page  = await browser.get(BIDFAX_HOME)
+        total = len(queries)
         await _wait_cf_clear(page)
         for i, q in enumerate(queries, 1):
-            results[q] = await _query_with_retries(page, q, makes.get(q, ""))
-            if i < len(queries):
+            result = await _query_with_retries(page, q, makes.get(q, ""))
+            results[q] = result
+            _log_lookup_result(i, total, q, result)
+            if i < total:
                 await asyncio.sleep(delay)
         return results
 
@@ -240,7 +243,9 @@ class BrowserBidfaxClient:
         Experimental: Cloudflare may challenge burst traffic, so each worker
         holds a permit from the semaphore for its full retry cycle.
         """
-        sem = asyncio.Semaphore(max_concurrent)
+        sem      = asyncio.Semaphore(max_concurrent)
+        total    = len(queries)
+        progress = {"done": 0}
 
         async def _worker(q: str) -> tuple[str, tuple[str, str, str]]:
             async with sem:
@@ -253,6 +258,8 @@ class BrowserBidfaxClient:
                         await tab.close()
                     except Exception:
                         pass
+                progress["done"] += 1
+                _log_lookup_result(progress["done"], total, q, result)
                 return q, result
 
         pairs = await asyncio.gather(*(_worker(q) for q in queries))
@@ -393,6 +400,26 @@ def run_batch_vins(
 # ---------------------------------------------------------------------------
 # Async browser helpers (private — only used by BrowserBidfaxClient)
 # ---------------------------------------------------------------------------
+
+def _log_lookup_result(idx: int, total: int, query: str, result: tuple[str, str, str]) -> None:
+    """Print one progress line per bidfax lookup.
+
+    Format:
+        [bidfax 3/12] 50900496 → $27,000  VIN:JM3K…  https://bidfax.info/...
+        [bidfax 3/12] 50900496 → No Price
+    The 'No Price' branch covers both 'bidfax has no result' and 'every retry
+    came back with the wrong make' (both surface as IN_PROGRESS, "", "").
+    """
+    price, vin, url = result
+    if url and price != IN_PROGRESS:
+        print(f"  [bidfax {idx}/{total}] {query} → {price}  "
+              f"VIN:{vin or '—'}  {url}", flush=True)
+    elif url:
+        # URL but no final price (sale still open on bidfax)
+        print(f"  [bidfax {idx}/{total}] {query} → No Price  ({url})", flush=True)
+    else:
+        print(f"  [bidfax {idx}/{total}] {query} → No Price", flush=True)
+
 
 async def _wait_cf_clear(page) -> None:
     async def _poll() -> None:

@@ -195,5 +195,53 @@ class TestQueryWithRetriesMakeValidation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out, (IN_PROGRESS, "", ""))
 
 
+class TestLogLookupResult(unittest.TestCase):
+    """Per-lot progress lines so price_refresh / bidfax_info etc. can show
+    'this lot got X' as it queries each one."""
+
+    def _capture(self, *args, **kwargs):
+        from clients.bidfax import _log_lookup_result
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _log_lookup_result(*args, **kwargs)
+        return buf.getvalue()
+
+    def test_found_line_includes_lot_price_vin_url(self):
+        out = self._capture(
+            3, 12, "50900496",
+            ("$27,000", "JM3KKCHD2T1353518",
+             "https://bidfax.info/mazda/cx-90/foo.html"),
+        )
+        self.assertIn("[bidfax 3/12]", out)
+        self.assertIn("50900496",     out)
+        self.assertIn("$27,000",      out)
+        self.assertIn("JM3KKCHD2T1353518", out)
+        self.assertIn("https://bidfax.info/mazda/cx-90/foo.html", out)
+
+    def test_no_price_line_when_in_progress_and_no_url(self):
+        out = self._capture(1, 1, "12345", (IN_PROGRESS, "", ""))
+        self.assertIn("[bidfax 1/1]", out)
+        self.assertIn("12345",        out)
+        self.assertIn("No Price",     out)
+        self.assertNotIn("https://",  out)
+
+    def test_no_price_line_when_url_but_in_progress(self):
+        # bidfax found a listing but the auction is still open
+        out = self._capture(
+            2, 5, "99999",
+            (IN_PROGRESS, "", "https://bidfax.info/foo/bar/baz.html"),
+        )
+        self.assertIn("No Price",                              out)
+        self.assertIn("https://bidfax.info/foo/bar/baz.html",  out)
+
+    def test_em_dash_when_vin_missing(self):
+        out = self._capture(
+            1, 1, "X",
+            ("$1", "", "https://bidfax.info/x/y/z.html"),
+        )
+        self.assertIn("VIN:—", out)
+
+
 if __name__ == "__main__":
     unittest.main()
