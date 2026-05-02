@@ -243,5 +243,153 @@ class TestLogLookupResult(unittest.TestCase):
         self.assertIn("VIN:—", out)
 
 
+class TestSearchOncePollBudget(unittest.IsolatedAsyncioTestCase):
+    """Regression: when Cloudflare's challenge stays up for several seconds,
+    the grid-extraction polls must NOT be charged for those CF iterations.
+    The old code (`if i >= 5: return IN_PROGRESS`) bailed after 6 raw
+    iterations regardless of CF state — so a slow CF clear left zero polls
+    to find the grid, and bidfax results were silently dropped."""
+
+    async def _drive(self, page_html_sequence, recaptcha_token: str = "valid-token"):
+        """Simulate `page.get_content()` returning each item in sequence.
+
+        `recaptcha_token` controls what `_wait_for_recaptcha_token`'s
+        page.evaluate('…token2…') returns. Default is non-empty so the
+        existing tests don't have to care about the reCAPTCHA wait.
+        """
+        import clients.bidfax as bf
+
+        seq = iter(page_html_sequence)
+
+        class FakePage:
+            url = "https://bidfax.info/results/foo"
+            async def get(self, _url):
+                await _REAL_ASYNCIO_SLEEP(0)
+            async def find(self, _sel):
+                # _fill_and_submit needs both #search and #submit to exist
+                await _REAL_ASYNCIO_SLEEP(0)
+                class _El:
+                    async def click(self): await _REAL_ASYNCIO_SLEEP(0)
+                    async def send_keys(self, _v): await _REAL_ASYNCIO_SLEEP(0)
+                return _El()
+            async def evaluate(self, _js):
+                # _wait_for_recaptcha_token reads the page-side token2 value
+                await _REAL_ASYNCIO_SLEEP(0)
+                return recaptcha_token
+            async def get_content(self):
+                await _REAL_ASYNCIO_SLEEP(0)
+                try:    return next(seq)
+                except StopIteration: return ""
+
+        async def fast_sleep(_s): await _REAL_ASYNCIO_SLEEP(0)
+        # Suppress the on-disk diagnostic dump so tests don't leave artefacts.
+        def quiet_dump(*_args, **_kwargs): return None
+        orig_sleep = bf.asyncio.sleep
+        orig_dump  = bf._dump_empty_search
+        bf.asyncio.sleep      = fast_sleep
+        bf._dump_empty_search = quiet_dump
+        try:
+            return await bf._search_once(FakePage(), "44602912")
+        finally:
+            bf.asyncio.sleep      = orig_sleep
+            bf._dump_empty_search = orig_dump
+
+    async def test_grid_after_long_cloudflare_still_found(self):
+        """6 CF-loading polls then the grid arrives — must NOT bail early."""
+        cf      = "<html>cf_chl loading…</html>"
+        success = """
+        <div id='grid'>
+          <span class='prices'>27000</span>
+          <a href='https://bidfax.info/honda/cr-v/foo-vin-jm3kkchd2t1353518.html'>x</a>
+        </div>
+        """
+        # 6 CF polls then the grid — old code bailed at i >= 5 regardless
+        out = await self._drive([cf]*6 + [success])
+        self.assertEqual(out[0], "$27,000")
+        self.assertIn("bidfax.info/honda/cr-v", out[2])
+
+    async def test_no_grid_after_full_budget_returns_in_progress(self):
+        """If the grid never appears within the budget, bail with IN_PROGRESS."""
+        empty_post_cf = "<html><body>no grid</body></html>"
+        out = await self._drive([empty_post_cf] * 30)
+        self.assertEqual(out, (IN_PROGRESS, "", ""))
+
+    async def test_homepage_bounce_after_submit_bails_immediately(self):
+        """Regression for the May 2026 reCAPTCHA-bounce issue: bidfax sometimes
+        accepts the URL transition (querystring) but re-renders the homepage
+        because the reCAPTCHA token wasn't validated. The homepage HTML
+        contains `id="search"` (the search input). Detect it and bail
+        immediately — don't waste the full grid-poll budget."""
+        homepage = '<html><body><input type="text" id="search"></body></html>'
+        # Even a single homepage-content poll should cause an immediate bail.
+        out = await self._drive([homepage] + ["<html>x</html>"] * 30)
+        self.assertEqual(out, (IN_PROGRESS, "", ""))
+
+    async def test_empty_recaptcha_token_aborts_submission(self):
+        """When the reCAPTCHA token never populates, _fill_and_submit must
+        return False (search aborted) instead of submitting an empty form
+        which would silently bounce back to the homepage."""
+        # _fill_and_submit aborts before any get_content polling, so the
+        # html sequence is irrelevant. Token is empty → wait times out.
+        out = await self._drive(["<html>shouldn't reach here</html>"],
+                                recaptcha_token="")
+        self.assertEqual(out, (IN_PROGRESS, "", ""))
+
+
+class TestWaitForRecaptchaToken(unittest.IsolatedAsyncioTestCase):
+    """Unit tests for the reCAPTCHA-token wait helper itself."""
+
+    async def _run(self, evaluate_returns, cap_seconds: float = 0.05):
+        import clients.bidfax as bf
+
+        results = iter(evaluate_returns)
+
+        class FakePage:
+            async def evaluate(self, _js):
+                await _REAL_ASYNCIO_SLEEP(0)
+                try:    return next(results)
+                except StopIteration: return ""
+
+        async def fast_sleep(_s): await _REAL_ASYNCIO_SLEEP(0)
+        orig = bf.asyncio.sleep
+        bf.asyncio.sleep = fast_sleep
+        try:
+            return await bf._wait_for_recaptcha_token(FakePage(), timeout=cap_seconds)
+        finally:
+            bf.asyncio.sleep = orig
+
+    async def test_token_present_immediately(self):
+        self.assertTrue(await self._run(["valid-token"]))
+
+    async def test_token_appears_after_a_few_polls(self):
+        # First few polls return empty, then a token shows up
+        self.assertTrue(await self._run(["", "", "", "valid-token"], cap_seconds=10.0))
+
+    async def test_token_never_appears_returns_false(self):
+        self.assertFalse(await self._run([""] * 100, cap_seconds=0.5))
+
+    async def test_evaluate_raising_is_treated_as_empty(self):
+        """If page.evaluate throws (page not ready), keep polling."""
+        import clients.bidfax as bf
+        attempts = {"n": 0}
+
+        class FakePage:
+            async def evaluate(self, _js):
+                await _REAL_ASYNCIO_SLEEP(0)
+                attempts["n"] += 1
+                if attempts["n"] < 3:
+                    raise RuntimeError("page not ready")
+                return "valid-token"
+
+        async def fast_sleep(_s): await _REAL_ASYNCIO_SLEEP(0)
+        orig = bf.asyncio.sleep
+        bf.asyncio.sleep = fast_sleep
+        try:
+            self.assertTrue(await bf._wait_for_recaptcha_token(FakePage(), timeout=10.0))
+        finally:
+            bf.asyncio.sleep = orig
+        self.assertGreaterEqual(attempts["n"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

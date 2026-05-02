@@ -401,6 +401,31 @@ def run_batch_vins(
 # Async browser helpers (private — only used by BrowserBidfaxClient)
 # ---------------------------------------------------------------------------
 
+def _dump_empty_search(query: str, html: str) -> None:
+    """Save a snippet of the page when bidfax search came back empty.
+
+    The grid-extraction logic returning None after Cloudflare cleared usually
+    means 'no result on bidfax' — but it can also mean the page shape changed
+    (selector drift) or Cloudflare blocked us in a soft way. Either case is
+    much easier to investigate when we have the actual HTML on disk.
+    """
+    if not html:
+        return
+    try:
+        from datetime import datetime
+        log_dir = Path(__file__).resolve().parent.parent / "logs"
+        log_dir.mkdir(exist_ok=True)
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = log_dir / f"bidfax_empty_{query}_{ts}.html"
+        # Cap at ~30KB — enough to inspect the page structure without
+        # filling the disk on a long batch where many lots return empty.
+        path.write_text(html[:30_000], encoding="utf-8")
+        print(f"    [bidfax] empty result for {query} — page snippet → {path}",
+              flush=True)
+    except Exception as e:
+        print(f"    [bidfax] could not save empty-result snippet: {e}", flush=True)
+
+
 def _log_lookup_result(idx: int, total: int, query: str, result: tuple[str, str, str]) -> None:
     """Print one progress line per bidfax lookup.
 
@@ -433,6 +458,38 @@ async def _wait_cf_clear(page) -> None:
         pass
 
 
+_RECAPTCHA_WAIT_TIMEOUT = 20.0   # seconds
+
+
+async def _wait_for_recaptcha_token(page, timeout: float = _RECAPTCHA_WAIT_TIMEOUT) -> bool:
+    """Poll until bidfax's hidden #token2 input has a value.
+
+    Bidfax uses Google reCAPTCHA v3; the script populates the hidden
+    `<input id="token2">` after the page loads. If we click submit before
+    that field has a value, the server silently ignores the search and
+    re-renders the homepage — which used to look (to us) like a successful
+    navigation that returned an empty grid. Block here until the token is
+    in place so the submission is real.
+    """
+    js = (
+        "(function(){"
+        "  var t=document.getElementById('token2');"
+        "  return t && t.value ? t.value : '';"
+        "})();"
+    )
+    elapsed = 0.0
+    while elapsed < timeout:
+        try:
+            val = await page.evaluate(js)
+        except Exception:
+            val = None
+        if val:
+            return True
+        await asyncio.sleep(0.5)
+        elapsed += 0.5
+    return False
+
+
 async def _fill_and_submit(page, query: str) -> bool:
     search_input = await page.find("#search")
     if not search_input:
@@ -442,6 +499,13 @@ async def _fill_and_submit(page, query: str) -> bool:
     await asyncio.sleep(0.5)
     await search_input.send_keys(query)
     await asyncio.sleep(0.5)
+
+    if not await _wait_for_recaptcha_token(page):
+        print(f"    [bidfax] reCAPTCHA token not populated for {query!r} "
+              f"— aborting submit (server would silently bounce back to home)",
+              flush=True)
+        return False
+
     submit_btn = await page.find("#submit")
     if not submit_btn:
         return False
@@ -461,22 +525,56 @@ async def _wait_for_navigation(page) -> bool:
     return False
 
 
+_GRID_POLL_BUDGET     = 10   # polls (1s each) AFTER Cloudflare clears
+_TOTAL_POLL_HARD_CAP  = 30   # safety net so we never spin forever
+
+# Marker that's only on the bidfax homepage (the search-input element by id).
+# Search-result pages don't render this input, so its presence after a
+# submission means the server bounced us back without searching.
+_HOMEPAGE_MARKER = 'id="search"'
+
+
 async def _search_once(page, query: str) -> tuple[str, str, str]:
-    """Perform one bidfax search on an existing page. Returns (price, vin, url)."""
+    """Perform one bidfax search on an existing page. Returns (price, vin, url).
+
+    Polls the page in 1-second steps. Iterations where Cloudflare is still
+    showing its challenge ("cf_chl" present) don't count against the
+    grid-extraction budget — otherwise a slow CF challenge consumes all the
+    polls and we bail before the result grid has a chance to render.
+    """
     if not await _fill_and_submit(page, query):
         return IN_PROGRESS, "", ""
     if not await _wait_for_navigation(page):
         return IN_PROGRESS, "", ""
-    for i in range(15):
+
+    polls_after_cf = 0
+    last_html      = ""
+    for _ in range(_TOTAL_POLL_HARD_CAP):
         await asyncio.sleep(1)
-        html = await page.get_content()
-        if "cf_chl" in html:
+        last_html = await page.get_content()
+        if "cf_chl" in last_html:
             continue
-        result = extract_grid_result(html)
+        result = extract_grid_result(last_html)
         if result is not None:
             return result
-        if i >= 5:
+        # If the page is back to the homepage (search input visible, no grid),
+        # the server rejected the submission — usually a missed reCAPTCHA
+        # token. Bail immediately with a clear log instead of polling.
+        if _HOMEPAGE_MARKER in last_html:
+            print(f"    [bidfax] {query!r}: server bounced back to homepage "
+                  f"(reCAPTCHA / rate limit) — treating as not found",
+                  flush=True)
+            _dump_empty_search(query, last_html)
             return IN_PROGRESS, "", ""
+        polls_after_cf += 1
+        if polls_after_cf >= _GRID_POLL_BUDGET:
+            break
+
+    # Search reached this point with CF cleared but no grid result —
+    # most likely bidfax has nothing for `query`, but it could also be a
+    # page-shape change (different result-URL pattern, missing #grid). Dump
+    # a snippet so the next failure is debuggable instead of silent.
+    _dump_empty_search(query, last_html)
     return IN_PROGRESS, "", ""
 
 
