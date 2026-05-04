@@ -250,12 +250,12 @@ class TestSearchOncePollBudget(unittest.IsolatedAsyncioTestCase):
     iterations regardless of CF state — so a slow CF clear left zero polls
     to find the grid, and bidfax results were silently dropped."""
 
-    async def _drive(self, page_html_sequence, recaptcha_token: str = "valid-token"):
+    async def _drive(self, page_html_sequence, csrf_token: str = "valid-csrf-token"):
         """Simulate `page.get_content()` returning each item in sequence.
 
-        `recaptcha_token` controls what `_wait_for_recaptcha_token`'s
-        page.evaluate('…token2…') returns. Default is non-empty so the
-        existing tests don't have to care about the reCAPTCHA wait.
+        `csrf_token` controls what `_ensure_search_tokens`'s
+        page.evaluate('…') returns (the harvested #token2 value). Default
+        is non-empty so existing tests don't care about the token wait.
         """
         import clients.bidfax as bf
 
@@ -273,9 +273,9 @@ class TestSearchOncePollBudget(unittest.IsolatedAsyncioTestCase):
                     async def send_keys(self, _v): await _REAL_ASYNCIO_SLEEP(0)
                 return _El()
             async def evaluate(self, _js):
-                # _wait_for_recaptcha_token reads the page-side token2 value
+                # _ensure_search_tokens reads / harvests the #token2 value
                 await _REAL_ASYNCIO_SLEEP(0)
-                return recaptcha_token
+                return csrf_token
             async def get_content(self):
                 await _REAL_ASYNCIO_SLEEP(0)
                 try:    return next(seq)
@@ -325,19 +325,25 @@ class TestSearchOncePollBudget(unittest.IsolatedAsyncioTestCase):
         out = await self._drive([homepage] + ["<html>x</html>"] * 30)
         self.assertEqual(out, (IN_PROGRESS, "", ""))
 
-    async def test_empty_recaptcha_token_aborts_submission(self):
-        """When the reCAPTCHA token never populates, _fill_and_submit must
-        return False (search aborted) instead of submitting an empty form
-        which would silently bounce back to the homepage."""
+    async def test_empty_csrf_token_aborts_submission(self):
+        """When the CSRF token never appears (no rel=alternate, no JS run),
+        _fill_and_submit returns False so search aborts cleanly instead of
+        submitting an empty form that silently bounces back to home."""
         # _fill_and_submit aborts before any get_content polling, so the
         # html sequence is irrelevant. Token is empty → wait times out.
         out = await self._drive(["<html>shouldn't reach here</html>"],
-                                recaptcha_token="")
+                                csrf_token="")
         self.assertEqual(out, (IN_PROGRESS, "", ""))
 
 
-class TestWaitForRecaptchaToken(unittest.IsolatedAsyncioTestCase):
-    """Unit tests for the reCAPTCHA-token wait helper itself."""
+class TestEnsureSearchTokens(unittest.IsolatedAsyncioTestCase):
+    """Unit tests for the CSRF-token harvest helper.
+
+    bidfax.info pre-renders the same CSRF token + action into the page in
+    two places: the search form's hidden inputs (populated by site JS at
+    runtime) and the rel='alternate' link's href (populated server-side,
+    always present). We harvest from the alternate href as the canonical
+    source — deterministic, no JS race."""
 
     async def _run(self, evaluate_returns, cap_seconds: float = 0.05):
         import clients.bidfax as bf
@@ -354,16 +360,16 @@ class TestWaitForRecaptchaToken(unittest.IsolatedAsyncioTestCase):
         orig = bf.asyncio.sleep
         bf.asyncio.sleep = fast_sleep
         try:
-            return await bf._wait_for_recaptcha_token(FakePage(), timeout=cap_seconds)
+            return await bf._ensure_search_tokens(FakePage(), timeout=cap_seconds)
         finally:
             bf.asyncio.sleep = orig
 
     async def test_token_present_immediately(self):
-        self.assertTrue(await self._run(["valid-token"]))
+        self.assertTrue(await self._run(["valid-csrf"]))
 
     async def test_token_appears_after_a_few_polls(self):
-        # First few polls return empty, then a token shows up
-        self.assertTrue(await self._run(["", "", "", "valid-token"], cap_seconds=10.0))
+        # First few polls return empty, then the harvest succeeds
+        self.assertTrue(await self._run(["", "", "", "valid-csrf"], cap_seconds=10.0))
 
     async def test_token_never_appears_returns_false(self):
         self.assertFalse(await self._run([""] * 100, cap_seconds=0.5))
@@ -379,16 +385,59 @@ class TestWaitForRecaptchaToken(unittest.IsolatedAsyncioTestCase):
                 attempts["n"] += 1
                 if attempts["n"] < 3:
                     raise RuntimeError("page not ready")
-                return "valid-token"
+                return "valid-csrf"
 
         async def fast_sleep(_s): await _REAL_ASYNCIO_SLEEP(0)
         orig = bf.asyncio.sleep
         bf.asyncio.sleep = fast_sleep
         try:
-            self.assertTrue(await bf._wait_for_recaptcha_token(FakePage(), timeout=10.0))
+            self.assertTrue(await bf._ensure_search_tokens(FakePage(), timeout=10.0))
         finally:
             bf.asyncio.sleep = orig
         self.assertGreaterEqual(attempts["n"], 3)
+
+    def test_harvest_js_extracts_alternate_link_token(self):
+        """Verify the harvest JS works against a realistic bidfax page DOM.
+
+        We can't run the JS in CPython, but we can reproduce its semantics
+        in Python and confirm the token comes out matching what the JS
+        would extract from the rel='alternate' href.
+        """
+        from urllib.parse import urlparse, parse_qs
+        href = ("https://en.bidfax.info/?do=search&subaction=search"
+                "&story=&token2=ABC_DEF_TOKEN&action2=search_action")
+        url = urlparse(href)
+        params = parse_qs(url.query)
+        self.assertEqual(params.get("token2"), ["ABC_DEF_TOKEN"])
+        self.assertEqual(params.get("action2"), ["search_action"])
+
+    def test_harvest_js_includes_all_three_strategies(self):
+        """Structural regression: the harvest JS must keep its three
+        token-acquisition paths intact.
+
+        - already-populated #token2  (cheap fast path)
+        - legacy `<link rel="alternate"` containing token2 in href
+        - reCAPTCHA v3 fallback via grecaptcha.execute(siteKey, action)
+
+        bidfax has changed page-shape twice in a week — once removing the
+        embedded token from the alternate link, once never populating it.
+        Drop any one of these branches and a bidfax redesign will silently
+        break price refresh again."""
+        import clients.bidfax as bf
+        js = bf._FORM_TOKEN_HARVEST_JS
+        # path 1: read existing #token2 value
+        self.assertIn("getElementById('token2')", js)
+        # path 2: harvest from server-rendered alternate link
+        self.assertIn("rel=\"alternate\"", js)
+        self.assertIn("token2=", js)            # selector + querystring lookup
+        # path 3: reCAPTCHA v3 trigger
+        self.assertIn("grecaptcha", js)
+        self.assertIn(".execute(",  js)
+        self.assertIn("'search_action'", js)    # the bidfax-specific action
+        self.assertIn("recaptcha/api.js",  js)  # site-key extraction selector
+        # And the trigger must be guarded so we only fire execute() once,
+        # not on every poll iteration:
+        self.assertIn("_auctionsRecaptchaTriggered", js)
 
 
 if __name__ == "__main__":

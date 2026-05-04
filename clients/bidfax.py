@@ -401,6 +401,29 @@ def run_batch_vins(
 # Async browser helpers (private — only used by BrowserBidfaxClient)
 # ---------------------------------------------------------------------------
 
+def _dump_token_missing(query: str, html: str) -> None:
+    """Save a page snapshot when CSRF-token harvest gives up.
+
+    Tells us at a glance whether (a) Cloudflare is still showing its
+    challenge, (b) the page rendered but the rel='alternate' link is gone,
+    or (c) the link is there but its href no longer carries token2.
+    """
+    if not html:
+        return
+    try:
+        from datetime import datetime
+        log_dir = Path(__file__).resolve().parent.parent / "logs"
+        log_dir.mkdir(exist_ok=True)
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = log_dir / f"bidfax_token_missing_{query}_{ts}.html"
+        path.write_text(html[:30_000], encoding="utf-8")
+        print(f"    [bidfax] token-missing snapshot for {query} → {path}",
+              flush=True)
+    except Exception as e:
+        print(f"    [bidfax] could not save token-missing snippet: {e}",
+              flush=True)
+
+
 def _dump_empty_search(query: str, html: str) -> None:
     """Save a snippet of the page when bidfax search came back empty.
 
@@ -458,29 +481,84 @@ async def _wait_cf_clear(page) -> None:
         pass
 
 
-_RECAPTCHA_WAIT_TIMEOUT = 20.0   # seconds
+_FORM_TOKEN_TIMEOUT = 15.0   # seconds — reCAPTCHA v3 can take a few seconds
 
 
-async def _wait_for_recaptcha_token(page, timeout: float = _RECAPTCHA_WAIT_TIMEOUT) -> bool:
-    """Poll until bidfax's hidden #token2 input has a value.
+# Bidfax's search form has two hidden fields, `#token2` (CSRF / reCAPTCHA
+# token) and `#action2`. Both must be populated before submit, otherwise
+# the server silently bounces back to the homepage.
+#
+# Three sources, tried in order of cost:
+#   1. The fields already have values (bidfax's own JS won the race).
+#   2. The CSRF token is encoded into the `<link rel="alternate">` href
+#      (older bidfax pages did this; newer ones don't, so this is just a
+#      cheap legacy fast-path).
+#   3. Otherwise: fire reCAPTCHA v3 ourselves with the site key from the
+#      page's recaptcha api.js URL, action="search_action". The promise
+#      resolves into #token2 asynchronously; the outer Python loop polls
+#      for the value to appear.
+_FORM_TOKEN_HARVEST_JS = """
+(function() {
+    var t = document.getElementById('token2');
+    var a = document.getElementById('action2');
+    if (t && t.value) return t.value;
 
-    Bidfax uses Google reCAPTCHA v3; the script populates the hidden
-    `<input id="token2">` after the page loads. If we click submit before
-    that field has a value, the server silently ignores the search and
-    re-renders the homepage — which used to look (to us) like a successful
-    navigation that returned an empty grid. Block here until the token is
-    in place so the submission is real.
+    // 2: legacy alternate-link path
+    var alt = document.querySelector('link[rel="alternate"][href*="token2="]');
+    if (alt) {
+        try {
+            var url = new URL(alt.href);
+            var tok = url.searchParams.get('token2')  || '';
+            var act = url.searchParams.get('action2') || '';
+            if (t && tok) t.value = tok;
+            if (a && act) a.value = act;
+            if (tok) return tok;
+        } catch (e) { /* fall through */ }
+    }
+
+    // 3: trigger reCAPTCHA v3 ourselves (fire-and-forget; fills #token2 async)
+    if (!window._auctionsRecaptchaTriggered && typeof grecaptcha !== 'undefined') {
+        var siteKey = null;
+        var scripts = document.querySelectorAll('script[src*="recaptcha/api.js"]');
+        for (var i = 0; i < scripts.length; i++) {
+            var m = scripts[i].src.match(/[?&]render=([^&]+)/);
+            if (m) { siteKey = m[1]; break; }
+        }
+        if (siteKey) {
+            try {
+                window._auctionsRecaptchaTriggered = true;
+                grecaptcha.ready(function() {
+                    grecaptcha
+                        .execute(siteKey, {action: 'search_action'})
+                        .then(function(token) {
+                            if (t) t.value = token;
+                            if (a) a.value = 'search_action';
+                        });
+                });
+            } catch (e) { /* nothing to do */ }
+        }
+    }
+    return t && t.value ? t.value : '';
+})();
+"""
+
+
+async def _ensure_search_tokens(page, timeout: float = _FORM_TOKEN_TIMEOUT) -> bool:
+    """Make sure bidfax's hidden #token2 / #action2 fields are populated.
+
+    Strategy:
+      1. Poll for natural population (gives bidfax's own JS first crack).
+      2. After every poll, copy the CSRF tokens from the rel="alternate"
+         link into the form fields directly. The same JS runs whether the
+         input was empty or already filled — it's idempotent and a no-op
+         once #token2 has a value.
+
+    Returns True iff #token2 ends up non-empty.
     """
-    js = (
-        "(function(){"
-        "  var t=document.getElementById('token2');"
-        "  return t && t.value ? t.value : '';"
-        "})();"
-    )
     elapsed = 0.0
     while elapsed < timeout:
         try:
-            val = await page.evaluate(js)
+            val = await page.evaluate(_FORM_TOKEN_HARVEST_JS)
         except Exception:
             val = None
         if val:
@@ -500,8 +578,16 @@ async def _fill_and_submit(page, query: str) -> bool:
     await search_input.send_keys(query)
     await asyncio.sleep(0.5)
 
-    if not await _wait_for_recaptcha_token(page):
-        print(f"    [bidfax] reCAPTCHA token not populated for {query!r} "
+    if not await _ensure_search_tokens(page):
+        # Capture the page so we can see what the harvest JS was looking at
+        # when it gave up — could be Cloudflare not really cleared, or a DOM
+        # change that broke the alternate-link selector.
+        try:
+            html = await page.get_content()
+        except Exception:
+            html = ""
+        _dump_token_missing(query, html)
+        print(f"    [bidfax] CSRF tokens missing for {query!r} "
               f"— aborting submit (server would silently bounce back to home)",
               flush=True)
         return False
