@@ -672,40 +672,67 @@ async def _search_once(page, query: str) -> tuple[str, str, str]:
     return IN_PROGRESS, "", ""
 
 
+# Cap on attempts per failure mode. Bounces are kept short because they
+# usually mean "bidfax doesn't have this lot" (server bounces to homepage
+# both for missing lots and for rate-limited submissions; we can't tell
+# them apart from a single response). Wasting many retries on a not-found
+# lot just delays the rest of the batch. One quick retry catches the
+# transient rate-limit case without paying a big cost when it doesn't.
+_BOUNCE_MAX_ATTEMPTS    = 2     # initial + 1 retry
+_BOUNCE_RETRY_WAIT      = 5.0   # seconds before the single retry
+
+# Make-mismatch retries are different — bidfax DID accept the search and
+# returned a result, just for the wrong vehicle. Retrying often surfaces
+# the correct lot on the next try, so keep the budget generous.
+_MISMATCH_MAX_ATTEMPTS  = 3
+
+
 async def _query_with_retries(page, query: str, expected_make: str) -> tuple[str, str, str]:
-    """Run one bidfax search with up to 3 retries.
+    """Run one bidfax search; retry on two specific failure modes.
 
-    Two retry triggers:
-      * Wrong-make URL — bidfax's top hit belongs to a different vehicle
-        (e.g. Audi Q5 lot 41613606 surfacing a Nissan Leaf). Refusing the
-        match and retrying gives bidfax a chance to return the correct lot.
       * Homepage bounce — the server rejected our submission (low reCAPTCHA
-        score / rate-limit / stale token). Each retry navigates fresh, which
-        triggers a fresh reCAPTCHA execute() and usually clears the bounce.
+        score, rate-limit, or bidfax simply doesn't have this lot). One
+        retry after a 5s pause handles the transient rate-limit case;
+        more retries usually just confirm "not indexed".
+      * Wrong-make URL — bidfax returned a result for a different vehicle.
+        Up to 2 retries (3 attempts) — these are cheap (no backoff) and
+        the next bidfax hit is often correct.
 
-    Genuine "bidfax has no result" (empty URL but not a bounce) returns
-    immediately — no value in retrying because bidfax just doesn't index
-    that lot yet.
+    A genuine empty-grid "no result" (URL absent but not a bounce) returns
+    immediately — bidfax simply doesn't index that lot yet.
     """
-    for attempt in range(3):
+    bounce_attempts   = 0
+    mismatch_attempts = 0
+    while True:
         await page.get(BIDFAX_HOME)
         await asyncio.sleep(2)
         await _wait_cf_clear(page)
         try:
             price, vin, url = await _search_once(page, query)
         except _BidfaxBounce:
+            bounce_attempts += 1
+            if bounce_attempts >= _BOUNCE_MAX_ATTEMPTS:
+                print(f"    [bidfax] {query!r}: bounced again — giving up "
+                      f"(treat as not on bidfax)", flush=True)
+                return IN_PROGRESS, "", ""
             print(f"    [bidfax] {query!r}: server bounced back to homepage "
-                  f"(reCAPTCHA / rate limit) — retry {attempt + 1}/3",
-                  flush=True)
+                  f"(reCAPTCHA / rate limit) — retrying once after "
+                  f"{_BOUNCE_RETRY_WAIT:.0f}s", flush=True)
+            await asyncio.sleep(_BOUNCE_RETRY_WAIT)
             continue
+
         if not url:
             # Genuine "no result" — surface as not-found, don't waste retries.
             return IN_PROGRESS, "", ""
+
         if not expected_make or url_make_matches(expected_make, url):
             return price, vin, url
+
+        mismatch_attempts += 1
+        if mismatch_attempts >= _MISMATCH_MAX_ATTEMPTS:
+            # All retries surfaced the wrong vehicle — refuse to fabricate a price.
+            return IN_PROGRESS, "", ""
         print(f"    [bidfax] make mismatch for {query!r}: "
-              f"expected {expected_make!r}, got URL {url}", flush=True)
-    # All retries exhausted — either every retry bounced (rate-limit
-    # persistent), or every result had the wrong make. Either way refuse
-    # to fabricate a price.
-    return IN_PROGRESS, "", ""
+              f"expected {expected_make!r}, got URL {url} "
+              f"— retrying ({mismatch_attempts}/{_MISMATCH_MAX_ATTEMPTS - 1})",
+              flush=True)
