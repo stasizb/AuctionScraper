@@ -24,8 +24,9 @@ from typing import Callable, Protocol, runtime_checkable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.chrome import find_chrome
-from core.dates  import normalize_auction_date
+from core.chrome  import find_chrome
+from core.dates   import normalize_auction_date
+from core.filters import apply_age_filter
 
 try:
     import nodriver as uc
@@ -93,6 +94,9 @@ def _apply_segment(filters: dict, key: str, val: str) -> None:
     elif key in ("year_max", "yearmax"):
         try: filters["year_max"] = int(val)
         except ValueError: pass
+    elif key == "age":
+        try: filters["age"] = int(val)
+        except ValueError: pass
     elif key in ("odometer_max", "odo_max", "odometer"):
         try: filters["odometer_max"] = int(val)
         except ValueError: pass
@@ -111,7 +115,7 @@ def parse_filter_row(raw_line: str) -> dict:
             continue
         key = m.group(1).strip().lower().replace(" ", "_")
         _apply_segment(filters, key, m.group(2).strip())
-    return filters
+    return apply_age_filter(filters)
 
 
 def read_filters_csv(path: str) -> list[dict]:

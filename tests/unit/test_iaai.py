@@ -51,6 +51,21 @@ class TestParseFilterRow(unittest.TestCase):
         f = parse_filter_row("Make: HONDA, Unknown: junk")
         self.assertEqual(set(f.keys()), {"make"})
 
+    def test_age_sets_year_min(self):
+        from datetime import date
+        f = parse_filter_row("Make: Honda, Model: CR-V, Age: 2")
+        self.assertEqual(f["year_min"], date.today().year - 2)
+        self.assertNotIn("year_max", f)
+        self.assertNotIn("age", f)
+
+    def test_age_overrides_explicit_year_bounds(self):
+        from datetime import date
+        f = parse_filter_row(
+            "Make: Honda, Model: CR-V, Year min: 2010, Year max: 2015, Age: 3"
+        )
+        self.assertEqual(f["year_min"], date.today().year - 3)
+        self.assertNotIn("year_max", f)
+
 
 class TestReadFiltersCsv(unittest.TestCase):
     def test_skips_blank_and_comments(self):

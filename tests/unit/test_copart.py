@@ -67,6 +67,21 @@ class TestCopartSearchHelpers(unittest.TestCase):
         f = copart_search.parse_filter_row("Make: Lincoln, Model: Corsair;Nautilus")
         self.assertEqual(f["models"], ["CORSAIR", "NAUTILUS"])
 
+    def test_parse_filter_row_age_sets_year_min(self):
+        from datetime import date
+        f = copart_search.parse_filter_row("Make: Honda, Model: CR-V, Age: 2")
+        self.assertEqual(f["year_min"], date.today().year - 2)
+        self.assertNotIn("year_max", f)
+        self.assertNotIn("age", f)
+
+    def test_parse_filter_row_age_overrides_explicit_year_bounds(self):
+        from datetime import date
+        f = copart_search.parse_filter_row(
+            "Make: Honda, Model: CR-V, Year min: 2010, Year max: 2015, Age: 3"
+        )
+        self.assertEqual(f["year_min"], date.today().year - 3)
+        self.assertNotIn("year_max", f)
+
     def test_equipment_ok_missing(self):
         self.assertTrue(copart_search.equipment_ok({}, None))
 

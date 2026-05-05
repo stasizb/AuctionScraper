@@ -18,6 +18,8 @@ Copart.com Web Scraper
     Model        — модель, несколько через ";" (обязательно)
     Year min     — год от (опционально)
     Year max     — год до (опционально, по умолчанию текущий год + 1)
+    Age          — возраст в годах: Year min = текущий год − Age, Year max не задаётся.
+                   Age имеет приоритет над Year min / Year max (опционально)
     Odometer max — пробег до (опционально)
     Fuel Type    — тип топлива (опционально, по умолчанию GAS)
     Equipment    — комплектация, пост-фильтр по URL лота (опционально)
@@ -35,6 +37,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from clients import copart as copart_client
+from core.filters import apply_age_filter
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -75,6 +78,11 @@ def parse_filter_row(raw_line: str) -> dict:
             filters["year_min"] = int(val)
         elif key in ("year_max", "yearmax"):
             filters["year_max"] = int(val)
+        elif key == "age":
+            try:
+                filters["age"] = int(val)
+            except ValueError:
+                pass
         elif key in ("odometer_max", "odo_max", "odometer"):
             filters["odometer_max"] = int(val)
         elif key in ("fuel_type", "fueltype", "fuel"):
@@ -82,7 +90,7 @@ def parse_filter_row(raw_line: str) -> dict:
         elif key in ("equipment", "trim"):
             filters["equipment"] = val
 
-    return filters
+    return apply_age_filter(filters)
 
 
 def read_filters_csv(path: str) -> list[dict]:

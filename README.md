@@ -91,6 +91,7 @@ Each row defines one search. Supported fields:
 | `Model`       | Yes      | `CR-V` (use `;` for multiple: `Corsair;Nautilus`) |
 | `Year min`    | No       | `2023`                     |
 | `Year max`    | No       | `2025`                     |
+| `Age`         | No       | `2` — sets `Year min = current year − Age` and clears `Year max`. Takes priority over `Year min` / `Year max` when both are present. |
 | `Odometer max`| No       | `30000`                    |
 | `Fuel Type`   | No       | `Gas`, `Hybrid Engine`     |
 | `Equipment`   | No       | `Touring` (post-filter on lot URL/title) |
@@ -98,6 +99,11 @@ Each row defines one search. Supported fields:
 Example row:
 ```
 Make: Honda, Model: CR-V, Year min: 2023, Odometer max: 30000, Fuel Type: Hybrid Engine, Equipment: Touring
+```
+
+Use `Age` for rolling year windows that don't need yearly editing:
+```
+Make: Honda, Model: CR-V, Age: 2, Odometer max: 30000, Fuel Type: Hybrid Engine, Equipment: Touring
 ```
 
 ### 2. Run the full pipeline
