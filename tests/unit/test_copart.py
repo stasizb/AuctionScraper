@@ -93,6 +93,17 @@ class TestCopartSearchHelpers(unittest.TestCase):
         lot = {"ld": "Honda CR-V EX 2024"}
         self.assertFalse(copart_search.equipment_ok(lot, "Touring"))
 
+    def test_equipment_ok_finds_trim_in_other_fields(self):
+        # `ld` is a short description without the trim — the trim "4MATIC"
+        # only shows up in a different API field. The filter must still pass.
+        lot = {"ld": "Mercedes-Benz GLB 250", "lm": "GLB 250 4MATIC"}
+        self.assertTrue(copart_search.equipment_ok(lot, "4MATIC"))
+
+    def test_equipment_ok_ignores_non_string_fields(self):
+        # Numeric / non-string lot fields must not crash the scan.
+        lot = {"ld": "Honda CR-V TOURING 2024", "lcy": 2024, "ad": 1700000000000}
+        self.assertTrue(copart_search.equipment_ok(lot, "Touring"))
+
     def test_lot_to_row(self):
         lot = {
             "ln":  "12345",

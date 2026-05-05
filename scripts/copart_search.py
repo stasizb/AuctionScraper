@@ -131,12 +131,18 @@ def build_lot_url(lot: dict) -> str:
 def equipment_ok(lot: dict, equipment: str | None) -> bool:
     if not equipment:
         return True
-    eq    = re.sub(r"[\s\-]+", "", equipment.lower())
-    url   = re.sub(r"[\-]+", "", build_lot_url(lot).lower())
-    title = re.sub(r"[\s\-]+", "", (
-        lot.get("ld") or lot.get("lotName") or lot.get("description") or ""
-    ).lower())
-    return eq in url or eq in title
+    eq = re.sub(r"[\s\-]+", "", equipment.lower())
+    # The trim ("4MATIC", "Touring", "Premium 45", ...) can live in any of
+    # several Copart API fields depending on the lot — `ld`, `lm`, `lcd`,
+    # `tlt`, etc. — and Copart's frontend reassembles the displayed title
+    # from multiple of them. So scan every string-valued field in the lot
+    # plus the constructed URL.
+    haystack_parts = [build_lot_url(lot)]
+    for v in lot.values():
+        if isinstance(v, str):
+            haystack_parts.append(v)
+    haystack = re.sub(r"[\s\-]+", "", " ".join(haystack_parts).lower())
+    return eq in haystack
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +198,10 @@ def process_filters(filters: dict, client: copart_client.CopartClient) -> list[d
     matched = []
     for lot in raw_lots:
         if not equipment_ok(lot, equipment):
+            if equipment:
+                title = lot.get("ld") or lot.get("lotName") or lot.get("description") or ""
+                lot_num = lot.get("lotNumberStr") or lot.get("ln") or lot.get("lotNumber") or "?"
+                log.info(f"    drop {lot_num}: {title!r} — no {equipment!r} in title/URL")
             continue
         matched.append(lot_to_row(lot, filters))
 
