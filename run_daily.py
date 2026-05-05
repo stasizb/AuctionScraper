@@ -4,14 +4,17 @@ Daily auction pipeline orchestrator.
 
 Execution is split into three phases to exploit available parallelism:
 
-  Phase 1 (parallel)
-    1. copart_search.py      — scrape today's Copart lots   (HTTP only)
-    2. iaai_search.py        — scrape today's IAAI lots     (browser)
+  Phase 1 (parallel chains)
+    Chain A: copart_search.py → remove_duplicates.py
+       1. scrape today's Copart lots                       (HTTP only)
+       3. remove rescheduled Copart lots from yesterday    (file I/O)
+    Chain B: iaai_search.py
+       2. scrape today's IAAI lots                         (browser)
+    Step 3 only needs step 1's output, so it chains right after — no
+    reason to make it wait for the slower IAAI scrape to finish.
 
-  Phase 2 (parallel)  — runs after phase 1 completes
-    3. remove_duplicates.py  — remove rescheduled Copart lots (file I/O only)
+  Phase 2 (sequential) — runs after phase 1 completes
     5. bidfax_info.py iaai   — bidfax prices for yesterday's IAAI lots (browser)
-    Steps 3 and 5 touch entirely different files, so they are safe to overlap.
 
   Phase 3 (sequential) — steps share bidfax_cache.json / auction_results.xlsx
     4. bidfax_info.py copart — check Sale ended + bidfax prices for yesterday's Copart lots
@@ -180,19 +183,26 @@ def _prefix_for(name: str) -> str:
     return f"[{head}] "
 
 
-def run_parallel(steps: list[tuple[str, list[str]]]) -> None:
-    """Run steps concurrently and stream their output live.
+def run_parallel_chains(chains: list[list[tuple[str, list[str]]]]) -> None:
+    """Run multiple chains concurrently and stream their output live.
 
-    Each child's stdout (stderr merged in) is read line-by-line and prefixed
-    with the step's leading tag (e.g. `[1]`, `[2]`). Lines from different
-    steps may interleave but the prefix keeps them attributable, and the
-    user sees progress immediately instead of after the subprocess exits.
-    Exits if any step fails.
+    Each `chain` is a sequence of `(name, cmd)` steps that runs in order
+    within its own thread; chains run in parallel. If any step inside a
+    chain fails, the rest of that chain is skipped (its later steps are
+    not attempted) but the other chains keep running. Exits if any
+    chain failed at all, after all chains have finished.
+
+    Output streaming is unchanged from the previous flat `run_parallel`:
+    each child's stdout is read line-by-line, prefixed with the step's
+    leading tag, and emitted under a shared lock so lines stay readable
+    even when chains interleave. A single-step chain (`[[(name, cmd)]]`)
+    is the parallel-of-one case.
     """
     _lock    = threading.Lock()
     failures: list[tuple[str, int]] = []
 
-    def _run_one(name: str, cmd: list[str]) -> None:
+    def _exec_step(name: str, cmd: list[str]) -> int:
+        """Run one step inside a chain. Returns the subprocess exit code."""
         prefix = _prefix_for(name)
         with _lock:
             print(f"\n{'=' * 60}", flush=True)
@@ -226,8 +236,16 @@ def run_parallel(steps: list[tuple[str, list[str]]]) -> None:
                 print(f"\n[FAIL] {name} exited with code {proc.returncode}", flush=True)
                 _record(name, "fail", f"exit {proc.returncode}")
                 failures.append((name, proc.returncode))
+        return proc.returncode
 
-    threads = [threading.Thread(target=_run_one, args=s) for s in steps]
+    def _run_chain(chain: list[tuple[str, list[str]]]) -> None:
+        for name, cmd in chain:
+            if _exec_step(name, cmd) != 0:
+                # Stop this chain; remaining steps are skipped because
+                # they typically depend on the failing one's output.
+                break
+
+    threads = [threading.Thread(target=_run_chain, args=(c,)) for c in chains]
     for t in threads:
         t.start()
     for t in threads:
@@ -383,27 +401,8 @@ def main() -> None:
     bp = ["--browser-port", str(browser_port)]
 
     try:
-        # ---- Phase 1 (parallel): today's search scrapers -----------------
-        # Step 1 uses HTTP only; step 2 uses the browser. No shared files.
-        run_parallel([
-            (STEP_COPART_SEARCH, [
-                py, s("copart_search.py"),
-                "--input",  str(filters / "copart_filters.csv"),
-                "--output", o(f"copart_search_{today}.csv"),
-            ]),
-            (STEP_IAAI_SEARCH, [
-                py, s("iaai_search.py"),
-                "--input",       str(filters / "iaai_filters.csv"),
-                "--output",      o(f"iaai_search_{today}.csv"),
-                "--profile-dir", str(chrome_profile),
-                *bp,
-            ]),
-        ])
-
-        # Phase 1 done — capture how many lots each scraper produced.
-        _car_counts[STEP_COPART_SEARCH] = _count_csv_rows(output / f"copart_search_{today}.csv")
-        _car_counts[STEP_IAAI_SEARCH]   = _count_csv_rows(output / f"iaai_search_{today}.csv")
-
+        # Resolve yesterday's search dates up front so phase 1 can chain
+        # step 3 (which depends on them) onto the copart-search step.
         copart_date = _find_recent_search(output, "copart", _yesterday)
         iaai_date   = _find_recent_search(output, "iaai",   _yesterday)
 
@@ -417,13 +416,20 @@ def main() -> None:
             _car_counts[STEP_BIDFAX_IAAI] = _count_csv_rows(
                 output / f"iaai_search_{iaai_date}.csv")
 
-        # ---- Phase 2 (parallel): dedup + IAAI bidfax ---------------------
-        # Step 3 is pure file I/O (no browser, no cache).
-        # Step 5 uses the browser and bidfax cache.
-        # They touch entirely different files, so running together is safe.
-        phase2: list[tuple[str, list[str]]] = []
+        # ---- Phase 1 (parallel chains) -----------------------------------
+        # Chain A: copart_search → remove_duplicates. Step 3 only needs
+        #          step 1's output, so it can start as soon as step 1
+        #          finishes — no need to wait for step 2 (IAAI).
+        # Chain B: iaai_search alone. Browser-bound, the long pole.
+        chain_copart: list[tuple[str, list[str]]] = [
+            (STEP_COPART_SEARCH, [
+                py, s("copart_search.py"),
+                "--input",  str(filters / "copart_filters.csv"),
+                "--output", o(f"copart_search_{today}.csv"),
+            ]),
+        ]
         if copart_date:
-            phase2.append((STEP_REMOVE_DUPLICATES, [
+            chain_copart.append((STEP_REMOVE_DUPLICATES, [
                 py, s("remove_duplicates.py"),
                 "--auction", "copart",
                 "--src",  o(f"copart_search_{copart_date}.csv"),
@@ -432,8 +438,26 @@ def main() -> None:
         else:
             skip(STEP_REMOVE_DUPLICATES, "no recent copart search file found")
 
+        run_parallel_chains([
+            chain_copart,
+            [(STEP_IAAI_SEARCH, [
+                py, s("iaai_search.py"),
+                "--input",       str(filters / "iaai_filters.csv"),
+                "--output",      o(f"iaai_search_{today}.csv"),
+                "--profile-dir", str(chrome_profile),
+                *bp,
+            ])],
+        ])
+
+        # Phase 1 done — capture how many lots each scraper produced.
+        _car_counts[STEP_COPART_SEARCH] = _count_csv_rows(output / f"copart_search_{today}.csv")
+        _car_counts[STEP_IAAI_SEARCH]   = _count_csv_rows(output / f"iaai_search_{today}.csv")
+
+        # ---- Phase 2 (sequential): IAAI bidfax for yesterday -------------
+        # Step 3 used to live here alongside step 5; with step 3 chained
+        # into phase 1, only step 5 remains.
         if iaai_date:
-            phase2.append((STEP_BIDFAX_IAAI, [
+            run(STEP_BIDFAX_IAAI, [
                 py, s("bidfax_info.py"),
                 "--auction", "iaai",
                 "--date",    iaai_date,
@@ -441,14 +465,9 @@ def main() -> None:
                 "--cache",   bidfax_cache,
                 "--log",     str(logs / "bidfax_deletions.json"),
                 *bp,
-            ]))
+            ])
         else:
             skip(STEP_BIDFAX_IAAI, "no recent iaai search file found")
-
-        if len(phase2) > 1:
-            run_parallel(phase2)
-        elif phase2:
-            run(*phase2[0])
 
         # ---- Phase 3 (sequential): Copart bidfax → refresh → workbook → HTML
         # Steps 4, 6, 7, 8 share bidfax_cache.json and/or auction_results.xlsx;
