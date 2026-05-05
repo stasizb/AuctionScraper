@@ -484,39 +484,36 @@ async def _wait_cf_clear(page) -> None:
 _FORM_TOKEN_TIMEOUT = 15.0   # seconds — reCAPTCHA v3 can take a few seconds
 
 
-# Bidfax's search form has two hidden fields, `#token2` (CSRF / reCAPTCHA
-# token) and `#action2`. Both must be populated before submit, otherwise
+# Bidfax's search form has two hidden fields, `#token2` (a reCAPTCHA v3
+# token bound to the CURRENT browser session) and `#action2` (the static
+# string "search_action"). Both must be populated before submit, otherwise
 # the server silently bounces back to the homepage.
 #
-# Three sources, tried in order of cost:
-#   1. The fields already have values (bidfax's own JS won the race).
-#   2. The CSRF token is encoded into the `<link rel="alternate">` href
-#      (older bidfax pages did this; newer ones don't, so this is just a
-#      cheap legacy fast-path).
-#   3. Otherwise: fire reCAPTCHA v3 ourselves with the site key from the
-#      page's recaptcha api.js URL, action="search_action". The promise
-#      resolves into #token2 asynchronously; the outer Python loop polls
-#      for the value to appear.
+# Token sources, in order:
+#   1. The field already has a value because bidfax's own dle_js.js fired
+#      grecaptcha.execute() on page-load and stashed the token. Use it.
+#   2. Otherwise we fire grecaptcha.execute() ourselves with the site key
+#      lifted from the page's recaptcha/api.js?render=… URL and action
+#      "search_action". The promise resolves into #token2 asynchronously;
+#      the outer Python loop polls for the value to appear.
+#
+# Notes / regression history:
+#   * The token embedded in `<link rel="alternate" href="...token2=...">` is
+#     for SEO/hreflang URLs and is bound to a different session — the
+#     server REJECTS submissions that use it. An earlier version of this
+#     harvest preferred that path; on 2026-05-04 bidfax restored those
+#     embedded tokens to the page and our preferred-path-2 logic started
+#     poisoning every submission. Keep that path OUT.
 _FORM_TOKEN_HARVEST_JS = """
 (function() {
     var t = document.getElementById('token2');
     var a = document.getElementById('action2');
-    if (t && t.value) return t.value;
-
-    // 2: legacy alternate-link path
-    var alt = document.querySelector('link[rel="alternate"][href*="token2="]');
-    if (alt) {
-        try {
-            var url = new URL(alt.href);
-            var tok = url.searchParams.get('token2')  || '';
-            var act = url.searchParams.get('action2') || '';
-            if (t && tok) t.value = tok;
-            if (a && act) a.value = act;
-            if (tok) return tok;
-        } catch (e) { /* fall through */ }
+    if (t && t.value) {
+        // bidfax JS already filled the token; make sure action2 is set too.
+        if (a && !a.value) a.value = 'search_action';
+        return t.value;
     }
-
-    // 3: trigger reCAPTCHA v3 ourselves (fire-and-forget; fills #token2 async)
+    // Fire reCAPTCHA v3 ourselves; .then() fills #token2 + #action2 async.
     if (!window._auctionsRecaptchaTriggered && typeof grecaptcha !== 'undefined') {
         var siteKey = null;
         var scripts = document.querySelectorAll('script[src*="recaptcha/api.js"]');
@@ -620,6 +617,16 @@ _TOTAL_POLL_HARD_CAP  = 30   # safety net so we never spin forever
 _HOMEPAGE_MARKER = 'id="search"'
 
 
+class _BidfaxBounce(Exception):
+    """Server accepted the URL transition but rendered the homepage instead
+    of search results — usually a stale or low-scored reCAPTCHA v3 token.
+
+    Raised by `_search_once` so `_query_with_retries` can distinguish a
+    transient bounce (worth retrying with a fresh page + fresh token) from
+    a true 'no result on bidfax' (don't retry — bidfax just doesn't have
+    this lot indexed yet)."""
+
+
 async def _search_once(page, query: str) -> tuple[str, str, str]:
     """Perform one bidfax search on an existing page. Returns (price, vin, url).
 
@@ -627,6 +634,10 @@ async def _search_once(page, query: str) -> tuple[str, str, str]:
     showing its challenge ("cf_chl" present) don't count against the
     grid-extraction budget — otherwise a slow CF challenge consumes all the
     polls and we bail before the result grid has a chance to render.
+
+    Raises `_BidfaxBounce` when the page returns to the homepage layout
+    after submit (reCAPTCHA score too low / rate-limit). The caller can
+    decide whether to retry with a fresh page.
     """
     if not await _fill_and_submit(page, query):
         return IN_PROGRESS, "", ""
@@ -643,15 +654,12 @@ async def _search_once(page, query: str) -> tuple[str, str, str]:
         result = extract_grid_result(last_html)
         if result is not None:
             return result
-        # If the page is back to the homepage (search input visible, no grid),
-        # the server rejected the submission — usually a missed reCAPTCHA
-        # token. Bail immediately with a clear log instead of polling.
+        # Page came back as the homepage → server rejected the submission.
+        # Save a snapshot then signal the caller; transient bounces are
+        # often rescued by a fresh page navigation + fresh reCAPTCHA token.
         if _HOMEPAGE_MARKER in last_html:
-            print(f"    [bidfax] {query!r}: server bounced back to homepage "
-                  f"(reCAPTCHA / rate limit) — treating as not found",
-                  flush=True)
             _dump_empty_search(query, last_html)
-            return IN_PROGRESS, "", ""
+            raise _BidfaxBounce(query)
         polls_after_cf += 1
         if polls_after_cf >= _GRID_POLL_BUDGET:
             break
@@ -665,27 +673,39 @@ async def _search_once(page, query: str) -> tuple[str, str, str]:
 
 
 async def _query_with_retries(page, query: str, expected_make: str) -> tuple[str, str, str]:
-    """Run one bidfax search with up to 3 retries when the URL's make doesn't
-    match `expected_make` (guards against bidfax returning a wrong vehicle —
-    e.g. asking for Audi Q5 lot 41613606 but bidfax's top hit is a Nissan
-    Leaf with the same digits somewhere in its listing).
+    """Run one bidfax search with up to 3 retries.
 
-    If every retry comes back with a mismatched make, we treat the lot as
-    not-found and return (IN_PROGRESS, "", "") rather than hand back data
-    that belongs to a different vehicle. When `expected_make` is empty
-    (e.g. VIN lookups), the first URL is accepted without validation.
+    Two retry triggers:
+      * Wrong-make URL — bidfax's top hit belongs to a different vehicle
+        (e.g. Audi Q5 lot 41613606 surfacing a Nissan Leaf). Refusing the
+        match and retrying gives bidfax a chance to return the correct lot.
+      * Homepage bounce — the server rejected our submission (low reCAPTCHA
+        score / rate-limit / stale token). Each retry navigates fresh, which
+        triggers a fresh reCAPTCHA execute() and usually clears the bounce.
+
+    Genuine "bidfax has no result" (empty URL but not a bounce) returns
+    immediately — no value in retrying because bidfax just doesn't index
+    that lot yet.
     """
-    for _ in range(3):
+    for attempt in range(3):
         await page.get(BIDFAX_HOME)
         await asyncio.sleep(2)
         await _wait_cf_clear(page)
-        price, vin, url = await _search_once(page, query)
+        try:
+            price, vin, url = await _search_once(page, query)
+        except _BidfaxBounce:
+            print(f"    [bidfax] {query!r}: server bounced back to homepage "
+                  f"(reCAPTCHA / rate limit) — retry {attempt + 1}/3",
+                  flush=True)
+            continue
         if not url:
-            # bidfax returned no result — truly not found, surface that.
+            # Genuine "no result" — surface as not-found, don't waste retries.
             return IN_PROGRESS, "", ""
         if not expected_make or url_make_matches(expected_make, url):
             return price, vin, url
         print(f"    [bidfax] make mismatch for {query!r}: "
               f"expected {expected_make!r}, got URL {url}", flush=True)
-    # All retries returned URLs with the wrong make — refuse to use them.
+    # All retries exhausted — either every retry bounced (rate-limit
+    # persistent), or every result had the wrong make. Either way refuse
+    # to fabricate a price.
     return IN_PROGRESS, "", ""

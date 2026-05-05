@@ -194,6 +194,68 @@ class TestQueryWithRetriesMakeValidation(unittest.IsolatedAsyncioTestCase):
         out = await self._drive([(IN_PROGRESS, "", "")], expected_make="AUDI")
         self.assertEqual(out, (IN_PROGRESS, "", ""))
 
+    async def test_bounce_then_success_is_recovered(self):
+        """If the first attempt bounces but the second returns a valid
+        result, _query_with_retries must surface the success — transient
+        reCAPTCHA bounces shouldn't cost us the lot."""
+        import clients.bidfax as bf
+
+        # _search_once returns coroutines: first raise BidfaxBounce, then
+        # return the real result on the next call.
+        attempts = {"n": 0}
+        async def fake_search_once(_page, q):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise bf._BidfaxBounce(q)
+            return ("$8,600", "WA1XX", "https://bidfax.info/audi/q5/x.html")
+
+        async def no_op(*_a, **_kw): return None
+        async def fast_sleep(_s): return None
+
+        orig_search = bf._search_once
+        orig_wait   = bf._wait_cf_clear
+        orig_sleep  = bf.asyncio.sleep
+        bf._search_once   = fake_search_once
+        bf._wait_cf_clear = no_op
+        bf.asyncio.sleep  = fast_sleep
+        try:
+            class FakePage:
+                async def get(self, _url): return None
+            result = await bf._query_with_retries(FakePage(), "44628574", "AUDI")
+        finally:
+            bf._search_once   = orig_search
+            bf._wait_cf_clear = orig_wait
+            bf.asyncio.sleep  = orig_sleep
+
+        self.assertEqual(result[0], "$8,600")
+        self.assertEqual(attempts["n"], 2)   # bounced once, succeeded on retry
+
+    async def test_three_consecutive_bounces_returns_not_found(self):
+        """If every retry bounces, give up cleanly with IN_PROGRESS instead
+        of returning fabricated data or hanging."""
+        import clients.bidfax as bf
+
+        async def always_bounce(_page, q):
+            raise bf._BidfaxBounce(q)
+        async def no_op(*_a, **_kw): return None
+        async def fast_sleep(_s): return None
+
+        orig_search = bf._search_once
+        orig_wait   = bf._wait_cf_clear
+        orig_sleep  = bf.asyncio.sleep
+        bf._search_once   = always_bounce
+        bf._wait_cf_clear = no_op
+        bf.asyncio.sleep  = fast_sleep
+        try:
+            class FakePage:
+                async def get(self, _url): return None
+            result = await bf._query_with_retries(FakePage(), "X", "MAZDA")
+        finally:
+            bf._search_once   = orig_search
+            bf._wait_cf_clear = orig_wait
+            bf.asyncio.sleep  = orig_sleep
+        self.assertEqual(result, (IN_PROGRESS, "", ""))
+
 
 class TestLogLookupResult(unittest.TestCase):
     """Per-lot progress lines so price_refresh / bidfax_info etc. can show
@@ -314,16 +376,17 @@ class TestSearchOncePollBudget(unittest.IsolatedAsyncioTestCase):
         out = await self._drive([empty_post_cf] * 30)
         self.assertEqual(out, (IN_PROGRESS, "", ""))
 
-    async def test_homepage_bounce_after_submit_bails_immediately(self):
+    async def test_homepage_bounce_raises_bidfax_bounce(self):
         """Regression for the May 2026 reCAPTCHA-bounce issue: bidfax sometimes
         accepts the URL transition (querystring) but re-renders the homepage
-        because the reCAPTCHA token wasn't validated. The homepage HTML
-        contains `id="search"` (the search input). Detect it and bail
-        immediately — don't waste the full grid-poll budget."""
+        because the reCAPTCHA token wasn't validated. _search_once must
+        signal this with `_BidfaxBounce` so the caller can retry; if it
+        returned IN_PROGRESS instead, transient bounces would be lost
+        without a chance to recover via fresh navigation + fresh token."""
+        from clients.bidfax import _BidfaxBounce
         homepage = '<html><body><input type="text" id="search"></body></html>'
-        # Even a single homepage-content poll should cause an immediate bail.
-        out = await self._drive([homepage] + ["<html>x</html>"] * 30)
-        self.assertEqual(out, (IN_PROGRESS, "", ""))
+        with self.assertRaises(_BidfaxBounce):
+            await self._drive([homepage] + ["<html>x</html>"] * 30)
 
     async def test_empty_csrf_token_aborts_submission(self):
         """When the CSRF token never appears (no rel=alternate, no JS run),
@@ -411,33 +474,40 @@ class TestEnsureSearchTokens(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params.get("token2"), ["ABC_DEF_TOKEN"])
         self.assertEqual(params.get("action2"), ["search_action"])
 
-    def test_harvest_js_includes_all_three_strategies(self):
-        """Structural regression: the harvest JS must keep its three
-        token-acquisition paths intact.
+    def test_harvest_js_uses_recaptcha_not_alternate_link(self):
+        """Structural regression — both the present-day strategy AND the
+        anti-strategy that bit us on 2026-05-04/05.
 
-        - already-populated #token2  (cheap fast path)
-        - legacy `<link rel="alternate"` containing token2 in href
-        - reCAPTCHA v3 fallback via grecaptcha.execute(siteKey, action)
+        Required paths:
+          - already-populated #token2 (bidfax JS won the race)
+          - reCAPTCHA v3 fallback via grecaptcha.execute(siteKey, action)
 
-        bidfax has changed page-shape twice in a week — once removing the
-        embedded token from the alternate link, once never populating it.
-        Drop any one of these branches and a bidfax redesign will silently
-        break price refresh again."""
+        Forbidden path (regression bait): harvesting token2 from the
+        `<link rel="alternate" href="…?token2=…">` href. That token is for
+        SEO/hreflang URLs, the server treats it as a different session and
+        silently bounces every submission back to the homepage. Earlier
+        versions of this harvest preferred that path because it 'just
+        worked' on the first machine that tested it; in production it
+        poisons every submission as soon as bidfax re-embeds those
+        tokens. Don't put it back."""
         import clients.bidfax as bf
         js = bf._FORM_TOKEN_HARVEST_JS
-        # path 1: read existing #token2 value
+
+        # Required: fast-path on a pre-populated token
         self.assertIn("getElementById('token2')", js)
-        # path 2: harvest from server-rendered alternate link
-        self.assertIn("rel=\"alternate\"", js)
-        self.assertIn("token2=", js)            # selector + querystring lookup
-        # path 3: reCAPTCHA v3 trigger
-        self.assertIn("grecaptcha", js)
-        self.assertIn(".execute(",  js)
-        self.assertIn("'search_action'", js)    # the bidfax-specific action
-        self.assertIn("recaptcha/api.js",  js)  # site-key extraction selector
-        # And the trigger must be guarded so we only fire execute() once,
-        # not on every poll iteration:
+        # Required: reCAPTCHA v3 trigger
+        self.assertIn("grecaptcha",       js)
+        self.assertIn(".execute(",        js)
+        self.assertIn("'search_action'",  js)    # the bidfax-specific action
+        self.assertIn("recaptcha/api.js", js)    # site-key extraction selector
+        # Required: one-shot guard so we don't burn quota across poll iters
         self.assertIn("_auctionsRecaptchaTriggered", js)
+
+        # Forbidden: never read token2 out of a rel="alternate" link.
+        self.assertNotIn('rel="alternate"', js)
+        # The querystring fragment 'token2=' should only appear in the
+        # comment block above the JS, not inside the JS string itself.
+        self.assertNotIn("token2=", js)
 
 
 if __name__ == "__main__":
