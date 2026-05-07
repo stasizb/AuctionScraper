@@ -1,10 +1,16 @@
 # TODO
 
-- [ ] Check base URL for IAAI when Auction date and Run & Drive preselected.
-      Currently `clients/iaai.py` navigates to `https://www.iaai.com/Search`
-      and clicks "Run & Drive" + "Auction Today" featured filters per tab.
-      If IAAI exposes a URL with these filters baked in (query params), use
-      it as `IAAI_SEARCH_URL` to skip those clicks — saves ~2-3s per tab.
+- [x] Check base URL for IAAI when Auction date and Run & Drive preselected.
+      Done: `BrowserIAAIClient._resolve_base_url` opens /Search at startup,
+      applies Run & Drive + Auction Today + Odometer 30000, and captures
+      the resulting `?url=ENCODED_HASH` URL. Workers navigate straight to
+      that URL and skip those clicks. Per-row `odometer_max` is ignored
+      for now — see follow-up below.
+
+- [ ] Restore per-row Odometer max for IAAI. Currently the base URL bakes in
+      Odometer max = 30000 and `_scrape_one` ignores any per-row value with
+      a log warning. Either parametrize the base URL per row (one warmup
+      per distinct odometer) or apply odometer post-base-URL navigation.
 
 - [ ] Why do we have two sessions for bidfax? Investigate whether bidfax
       launches Chrome more than once per script run (or per daily pipeline)
@@ -14,3 +20,8 @@
       sat past their auction date with no resolved bidfax price are stale —
       define a cutoff (days since auction?) and prune them so the workbook
       doesn't grow unbounded.
+
+- [ ] Group messages from concurrent threads/tabs in the logs. Today, prints
+      from parallel IAAI tabs (and bidfax workers) interleave line-by-line,
+      making it hard to follow a single tab's progress. Tag each line with
+      a tab id, or buffer per-tab output and flush at end-of-tab.

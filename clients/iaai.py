@@ -54,6 +54,12 @@ WAIT_SHORT  = 1.5
 WAIT_MEDIUM = 3.0
 WAIT_LONG   = 5.0
 
+# We bake "Run & Drive" + "Auction Today" + Odometer max into a single
+# warmup URL at the start of every run, then point all per-row tabs at it.
+# This saves 3 click-and-wait cycles per tab and gives IAAI's URL encoding
+# (rather than session state) authority over the starting filters.
+_BAKED_ODO_MAX = 30000
+
 # DEFAULT_TAB_CONCURRENCY is re-exported from core.concurrency (set via the
 # DEFAULT_TAB_CONCURRENCY env var or the project-root .env file). It controls
 # how many filter rows scrape in parallel tabs; raising it speeds things up
@@ -273,6 +279,47 @@ class BrowserIAAIClient:
             pass
         chrome_proc.terminate()
 
+    async def _resolve_base_url(self, browser) -> str:
+        """Open /Search, apply Run & Drive + Auction Today + Odometer 30000,
+        and return the resulting filter-encoded URL.
+
+        Falls back to the plain /Search URL if anything fails — workers will
+        then apply the baked-in filters per-tab (slower but correct).
+        """
+        print("[iaai] resolving base URL with Run&Drive + Auction Today + "
+              f"Odo<={_BAKED_ODO_MAX} baked in...", flush=True)
+        page = None
+        try:
+            page = await asyncio.wait_for(
+                browser.get(IAAI_SEARCH_URL, new_tab=True), timeout=30.0,
+            )
+            await asyncio.sleep(WAIT_LONG)
+            await _clear_all_filters(page)
+            await _apply_featured_filter(page, "Run & Drive")
+            await _apply_featured_filter(page, "Auction Today")
+            await _apply_odometer_filter(page, _BAKED_ODO_MAX)
+            await asyncio.sleep(WAIT_MEDIUM)
+            url = await page.evaluate("window.location.href")
+            if not isinstance(url, str) or "?url=" not in url:
+                # IAAI didn't encode the filters into the URL — bail to
+                # the per-tab fallback path so we don't lose the bakes.
+                print(f"[iaai] [warn] base URL has no filter encoding "
+                      f"({url!r}); falling back to /Search per-tab",
+                      flush=True)
+                return IAAI_SEARCH_URL
+            print(f"[iaai] base URL: {url}", flush=True)
+            return url
+        except Exception as exc:
+            print(f"[iaai] [warn] base URL resolution failed: {exc} "
+                  f"— using /Search per-tab", flush=True)
+            return IAAI_SEARCH_URL
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
     async def _scrape_many_async(self, filter_rows: list[dict]) -> list[dict]:
         concurrency = min(self._tab_concurrency, len(filter_rows))
         total       = len(filter_rows)
@@ -280,6 +327,7 @@ class BrowserIAAIClient:
               f"tab_concurrency={concurrency}", flush=True)
         browser, chrome_proc = await self._start_browser()
         try:
+            base_url = await self._resolve_base_url(browser)
             sem     = asyncio.Semaphore(concurrency)
             results: list[list[dict]] = [[] for _ in filter_rows]
 
@@ -289,13 +337,11 @@ class BrowserIAAIClient:
                     tab = None
                     try:
                         tab = await asyncio.wait_for(
-                            browser.get(IAAI_SEARCH_URL, new_tab=True), timeout=30.0,
+                            browser.get(base_url, new_tab=True), timeout=30.0,
                         )
                         await asyncio.sleep(WAIT_LONG)
-                        # Always clear: IAAI restores prior filters from the
-                        # Chrome profile session (sticky between runs and tabs).
                         results[idx] = await self._scrape_one(
-                            tab, filters, clear_filters=True,
+                            tab, filters, row_idx=idx, base_url=base_url,
                         )
                     except Exception as exc:
                         print(f"[!] Error on filter set {idx + 1}: {exc}", flush=True)
@@ -314,27 +360,44 @@ class BrowserIAAIClient:
         finally:
             await self._stop_browser(browser, chrome_proc)
 
-    async def _scrape_one(self, page, filters: dict, clear_filters: bool) -> list[dict]:
-        await page.get(IAAI_SEARCH_URL)
+    async def _scrape_one(self, page, filters: dict,
+                          row_idx: int = 0,
+                          base_url: str = IAAI_SEARCH_URL) -> list[dict]:
+        # The caller already navigated to base_url before calling us, but
+        # re-navigate as a no-op safety measure if base_url differs from
+        # the page's current URL (e.g. legacy callers / tests).
+        await page.get(base_url)
         await asyncio.sleep(WAIT_LONG)
 
-        if clear_filters:
+        # base_url either contains an encoded filter state ("...?url=ENCODED")
+        # with Run & Drive + Auction Today + Odometer baked in, or it's the
+        # plain /Search fallback — in which case we apply those filters here.
+        is_pre_filtered = base_url != IAAI_SEARCH_URL
+
+        if not is_pre_filtered:
             await _clear_all_filters(page)
 
         make      = str(filters.get("make", "")).strip()
         models    = [str(m).strip() for m in (filters.get("models") or []) if str(m).strip()]
         year_min  = filters.get("year_min")
         year_max  = filters.get("year_max")
-        odo_max   = filters.get("odometer_max")
+        # Per-row odometer is intentionally ignored: the base URL bakes in
+        # Odometer max 30000 for everyone (see _BAKED_ODO_MAX). Future work:
+        # support per-row odometer override, see TODO.md.
+        row_odo   = filters.get("odometer_max")
         fuel_type = str(filters.get("fuel_type", "")).strip()
         equipment = str(filters.get("equipment", "")).strip()
 
+        odo_note = f"Odo<={_BAKED_ODO_MAX} (baked-in URL)"
+        if row_odo is not None and row_odo != _BAKED_ODO_MAX:
+            odo_note += f" — row odometer_max={row_odo} ignored"
         print(f"[iaai] Filters -> Make={make!r}, Models={models}, "
-              f"Year={year_min}-{year_max}, Odo<={odo_max}, "
+              f"Year={year_min}-{year_max}, {odo_note}, "
               f"Fuel={fuel_type!r}, Equipment={equipment!r}", flush=True)
 
-        await _apply_featured_filter(page, "Run & Drive")
-        await _apply_featured_filter(page, "Auction Today")
+        if not is_pre_filtered:
+            await _apply_featured_filter(page, "Run & Drive")
+            await _apply_featured_filter(page, "Auction Today")
         await _apply_year_filter(page, year_min, year_max)
         if not await _apply_make_filter(page, make):
             # Make not in today's filter panel — IAAI has no lots of this
@@ -345,8 +408,13 @@ class BrowserIAAIClient:
         if not await _apply_model_filters(page, models):
             return []
         await _apply_fuel_type_filter(page, fuel_type)
-        await _apply_odometer_filter(page, odo_max)
+        if not is_pre_filtered:
+            await _apply_odometer_filter(page, _BAKED_ODO_MAX)
         await asyncio.sleep(WAIT_MEDIUM)
+
+        # Snapshot the filtered results page for later debugging (e.g. when
+        # a filter mysteriously returns nothing) — see also TODO.md.
+        await _save_search_screenshot(page, row_idx, make)
 
         all_records: list[dict] = []
         page_num    = 1
@@ -450,6 +518,30 @@ async def _start_chrome(port: int, profile_dir: str) -> asyncio.subprocess.Proce
 # ---------------------------------------------------------------------------
 # Page interaction helpers (private)
 # ---------------------------------------------------------------------------
+
+_LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
+
+
+async def _save_search_screenshot(page, row_idx: int, make: str) -> None:
+    """Snap the current viewport after filters are applied.
+
+    Filename: logs/iaai_search_screenshot_<YYYY_MM_DD>_<row>_<MAKE>.png
+    Errors are swallowed — a failed screenshot must never break the scrape.
+    """
+    from datetime import date
+    safe_make = re.sub(r"[^A-Za-z0-9-]+", "_", make.upper()) or "UNKNOWN"
+    name      = (
+        f"iaai_search_screenshot_{date.today():%Y_%m_%d}"
+        f"_{row_idx + 1:02d}_{safe_make}.png"
+    )
+    path = _LOGS_DIR / name
+    try:
+        _LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        await page.save_screenshot(filename=str(path), format="png", full_page=True)
+        print(f"    [iaai] screenshot saved → {path}", flush=True)
+    except Exception as exc:
+        print(f"    [iaai] [warn] screenshot failed: {exc}", flush=True)
+
 
 async def _clear_all_filters(page) -> bool:
     js = """
