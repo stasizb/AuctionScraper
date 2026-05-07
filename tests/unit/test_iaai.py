@@ -5,6 +5,7 @@ import unittest
 from tests._helpers import ROOT  # noqa: F401
 
 from clients.iaai import (
+    DEFAULT_TAB_CONCURRENCY,
     FakeIAAIClient, OUTPUT_FIELDS,
     _parse_scraped_row,
     apply_equipment_postfilter, equipment_matches,
@@ -158,6 +159,43 @@ class TestFakeIAAIClient(unittest.TestCase):
         c = FakeIAAIClient(rows=[{"Lot Number": "x"}])
         self.assertEqual(c.scrape_with_filters({"make": "HONDA"}),
                          c.scrape_many([{"make": "HONDA"}]))
+
+
+class TestBrowserClientConcurrencyConfig(unittest.TestCase):
+    """BrowserIAAIClient should read tab_concurrency from its constructor and
+    expose a sensible default for the CLI / orchestrator to pick up."""
+
+    def test_default_constant_is_two(self):
+        # The product decision: parallel by default, but conservatively (2 tabs).
+        # If this changes, double-check IAAI hasn't started rate-limiting.
+        self.assertEqual(DEFAULT_TAB_CONCURRENCY, 2)
+
+    def test_explicit_value_overrides_default(self):
+        # We can't import BrowserIAAIClient unconditionally — it requires the
+        # `nodriver` package — so guard the import.
+        try:
+            from clients.iaai import BrowserIAAIClient
+        except RuntimeError:
+            self.skipTest("nodriver not installed")
+        c = BrowserIAAIClient(tab_concurrency=5)
+        self.assertEqual(c._tab_concurrency, 5)
+
+    def test_none_falls_back_to_default(self):
+        try:
+            from clients.iaai import BrowserIAAIClient
+        except RuntimeError:
+            self.skipTest("nodriver not installed")
+        c = BrowserIAAIClient()
+        self.assertEqual(c._tab_concurrency, DEFAULT_TAB_CONCURRENCY)
+
+    def test_zero_or_negative_clamped_to_one(self):
+        # Defensive: a misconfigured CLI flag of 0 would deadlock the semaphore.
+        try:
+            from clients.iaai import BrowserIAAIClient
+        except RuntimeError:
+            self.skipTest("nodriver not installed")
+        self.assertEqual(BrowserIAAIClient(tab_concurrency=0)._tab_concurrency,  1)
+        self.assertEqual(BrowserIAAIClient(tab_concurrency=-3)._tab_concurrency, 1)
 
 
 if __name__ == "__main__":

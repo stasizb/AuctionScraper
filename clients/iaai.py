@@ -53,6 +53,11 @@ WAIT_SHORT  = 1.5
 WAIT_MEDIUM = 3.0
 WAIT_LONG   = 5.0
 
+# How many filter rows to scrape concurrently in separate browser tabs.
+# Bumping this speeds up the scrape but increases the chance IAAI throttles
+# the session — keep small. Override per-run via --tab-concurrency.
+DEFAULT_TAB_CONCURRENCY = 2
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers (no browser)
@@ -212,11 +217,15 @@ class BrowserIAAIClient:
         self,
         browser_port: int | None = None,
         profile_dir: str | None = None,
+        tab_concurrency: int | None = None,
     ) -> None:
         if not _NODRIVER_OK:
             raise RuntimeError("nodriver is required. Install with:  pip install nodriver")
         self._browser_port = browser_port
         self._profile_dir  = profile_dir
+        if tab_concurrency is None:
+            tab_concurrency = DEFAULT_TAB_CONCURRENCY
+        self._tab_concurrency = max(1, tab_concurrency)
 
     # ---- Public interface --------------------------------------------------
 
@@ -264,26 +273,41 @@ class BrowserIAAIClient:
         chrome_proc.terminate()
 
     async def _scrape_many_async(self, filter_rows: list[dict]) -> list[dict]:
-        print(f"[iaai] scrape_many: {len(filter_rows)} filter set(s)", flush=True)
+        concurrency = min(self._tab_concurrency, len(filter_rows))
+        total       = len(filter_rows)
+        print(f"[iaai] scrape_many: {total} filter set(s), "
+              f"tab_concurrency={concurrency}", flush=True)
         browser, chrome_proc = await self._start_browser()
         try:
-            print(f"[iaai] opening {IAAI_SEARCH_URL} …", flush=True)
-            page = await asyncio.wait_for(browser.get(IAAI_SEARCH_URL), timeout=30.0)
-            await asyncio.sleep(WAIT_LONG)
-            print("[iaai] IAAI Search page loaded.", flush=True)
+            sem     = asyncio.Semaphore(concurrency)
+            results: list[list[dict]] = [[] for _ in filter_rows]
 
-            all_records: list[dict] = []
-            for idx, filters in enumerate(filter_rows, 1):
-                print(f"\n[*] Filter set {idx}/{len(filter_rows)}")
-                try:
-                    records = await self._scrape_one(page, filters, clear_filters=(idx > 1))
-                    all_records.extend(records)
-                except Exception as exc:
-                    print(f"[!] Error on filter set {idx}: {exc}")
-                    import traceback
-                    traceback.print_exc()
-                    await asyncio.sleep(3)
-            return all_records
+            async def _worker(idx: int, filters: dict) -> None:
+                async with sem:
+                    print(f"\n[*] Filter set {idx + 1}/{total} — opening tab", flush=True)
+                    tab = None
+                    try:
+                        tab = await asyncio.wait_for(
+                            browser.get(IAAI_SEARCH_URL, new_tab=True), timeout=30.0,
+                        )
+                        await asyncio.sleep(WAIT_LONG)
+                        results[idx] = await self._scrape_one(
+                            tab, filters, clear_filters=False,
+                        )
+                    except Exception as exc:
+                        print(f"[!] Error on filter set {idx + 1}: {exc}", flush=True)
+                        import traceback
+                        traceback.print_exc()
+                        await asyncio.sleep(3)
+                    finally:
+                        if tab is not None:
+                            try:
+                                await tab.close()
+                            except Exception:
+                                pass
+
+            await asyncio.gather(*(_worker(i, f) for i, f in enumerate(filter_rows)))
+            return [row for sub in results for row in sub]
         finally:
             await self._stop_browser(browser, chrome_proc)
 

@@ -130,7 +130,11 @@ Each script can be run standalone with sensible defaults.
 ```bash
 python scripts/copart_search.py                          # uses filters/copart_filters.csv
 python scripts/iaai_search.py                            # uses filters/iaai_filters.csv
+python scripts/iaai_search.py --tab-concurrency 1        # disable parallel tabs (sequential)
+python scripts/iaai_search.py --tab-concurrency 4        # bump parallelism (watch for IAAI throttling)
 ```
+
+`iaai_search.py` scrapes filter rows in parallel browser tabs. The default is **2** tabs (set via `DEFAULT_TAB_CONCURRENCY` in [clients/iaai.py](clients/iaai.py)); raising it speeds up the run but increases the chance IAAI rate-limits the session.
 
 ### Deduplicate
 

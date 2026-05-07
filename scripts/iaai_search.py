@@ -29,13 +29,14 @@ def process(
     output_path: str,
     profile_dir: str = "caches/chrome_profile_iaai",
     browser_port: int | None = None,
+    tab_concurrency: int | None = None,
     client: iaai_client.IAAIClient | None = None,
 ) -> None:
     """Run the full IAAI scrape pipeline. `client` may be injected for tests."""
     # Heartbeat so the orchestrator sees this subprocess started, even before
     # the browser attach (which is the most likely place to hang silently).
     print(f"[*] iaai_search.process starting (browser_port={browser_port}, "
-          f"profile_dir={profile_dir})", flush=True)
+          f"profile_dir={profile_dir}, tab_concurrency={tab_concurrency})", flush=True)
     print(f"[*] Reading filters from: {input_path}", flush=True)
     filter_rows = iaai_client.read_filters_csv(input_path)
     if not filter_rows:
@@ -44,7 +45,9 @@ def process(
     print(f"[*] {len(filter_rows)} filter set(s) to process.", flush=True)
 
     real_client = client or iaai_client.BrowserIAAIClient(
-        browser_port=browser_port, profile_dir=profile_dir,
+        browser_port=browser_port,
+        profile_dir=profile_dir,
+        tab_concurrency=tab_concurrency,
     )
 
     # scrape_many owns the browser lifecycle + per-filter error handling,
@@ -72,6 +75,10 @@ def cli() -> None:
                         help="Persistent Chrome profile directory (default: caches/chrome_profile_iaai)")
     parser.add_argument("--browser-port", type=int, default=None,
                         help="Connect to a running Chrome on this port instead of launching one")
+    parser.add_argument("--tab-concurrency", type=int,
+                        default=iaai_client.DEFAULT_TAB_CONCURRENCY,
+                        help=f"How many filter rows to scrape in parallel tabs "
+                             f"(default: {iaai_client.DEFAULT_TAB_CONCURRENCY})")
     args = parser.parse_args()
 
     if not Path(args.input).exists():
@@ -89,7 +96,10 @@ def cli() -> None:
         print(f"[!] '{args.input}' not found - created a sample file. Edit it and re-run.")
         sys.exit(0)
 
-    process(args.input, args.output, args.profile_dir, args.browser_port)
+    process(
+        args.input, args.output, args.profile_dir, args.browser_port,
+        tab_concurrency=args.tab_concurrency,
+    )
 
 
 if __name__ == "__main__":
