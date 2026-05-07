@@ -12,7 +12,7 @@
       a log warning. Either parametrize the base URL per row (one warmup
       per distinct odometer) or apply odometer post-base-URL navigation.
 
-- [ ] Why do we have two sessions for bidfax? Investigate whether bidfax
+- [x] Why do we have two sessions for bidfax? Investigate whether bidfax
       launches Chrome more than once per script run (or per daily pipeline)
       and whether the sessions can be consolidated into one.
 
@@ -21,7 +21,8 @@
       define a cutoff (days since auction?) and prune them so the workbook
       doesn't grow unbounded.
 
-- [ ] Group messages from concurrent threads/tabs in the logs. Today, prints
-      from parallel IAAI tabs (and bidfax workers) interleave line-by-line,
-      making it hard to follow a single tab's progress. Tag each line with
-      a tab id, or buffer per-tab output and flush at end-of-tab.
+- [x] Group messages from concurrent threads/tabs in the logs.
+      Done: `core/job_log.py` installs a contextvars-aware sys.stdout proxy;
+      each parallel worker enters `async with job_log():` and its prints
+      buffer per-task, flushing as one contiguous block at exit. Applied
+      to IAAI's filter-row workers and bidfax's per-lot workers.

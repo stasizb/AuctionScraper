@@ -29,6 +29,8 @@ from typing import Protocol, runtime_checkable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.concurrency import DEFAULT_TAB_CONCURRENCY
+from core.debug       import DEBUG_SCREENSHOTS
+from core.job_log     import job_log
 
 try:
     import nodriver as uc
@@ -253,7 +255,7 @@ class BrowserBidfaxClient:
         progress = {"done": 0}
 
         async def _worker(q: str) -> tuple[str, tuple[str, str, str]]:
-            async with sem:
+            async with sem, job_log():
                 tab = await browser.get(BIDFAX_HOME, new_tab=True)
                 try:
                     await _wait_cf_clear(tab)
@@ -435,7 +437,10 @@ async def _save_query_screenshot(page, query: str) -> None:
 
     One file per try (timestamped), so a lot that retried 3 times produces
     3 distinct screenshots. Errors are swallowed — must never break lookup.
+    Gated on `DEBUG_SCREENSHOTS` (env / .env): off by default.
     """
+    if not DEBUG_SCREENSHOTS:
+        return
     from datetime import datetime
     log_dir = Path(__file__).resolve().parent.parent / "logs"
     ts   = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]   # ms precision

@@ -26,8 +26,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.chrome      import find_chrome
 from core.dates       import normalize_auction_date
+from core.debug       import DEBUG_SCREENSHOTS
 from core.filters     import apply_age_filter
 from core.concurrency import DEFAULT_TAB_CONCURRENCY  # noqa: F401  (re-exported)
+from core.job_log     import job_log
 
 try:
     import nodriver as uc
@@ -332,7 +334,7 @@ class BrowserIAAIClient:
             results: list[list[dict]] = [[] for _ in filter_rows]
 
             async def _worker(idx: int, filters: dict) -> None:
-                async with sem:
+                async with sem, job_log():
                     print(f"\n[*] Filter set {idx + 1}/{total} — opening tab", flush=True)
                     tab = None
                     try:
@@ -527,7 +529,11 @@ async def _save_search_screenshot(page, row_idx: int, make: str) -> None:
 
     Filename: logs/iaai_search_screenshot_<YYYY_MM_DD>_<row>_<MAKE>.png
     Errors are swallowed — a failed screenshot must never break the scrape.
+    Gated on `DEBUG_SCREENSHOTS` (env / .env): off by default to keep
+    routine runs fast and disk-light.
     """
+    if not DEBUG_SCREENSHOTS:
+        return
     from datetime import date
     safe_make = re.sub(r"[^A-Za-z0-9-]+", "_", make.upper()) or "UNKNOWN"
     name      = (

@@ -57,11 +57,13 @@ class TestDefaultTabConcurrency(unittest.TestCase):
         importlib.reload(concurrency_mod)
 
     def test_unset_env_with_repo_dotenv_uses_dotenv_value(self):
-        # The repo ships with .env containing DEFAULT_TAB_CONCURRENCY=2 —
-        # that's the documented default for fresh checkouts.
+        # When the env var is unset, the value must come from the repo's
+        # .env file. Read it ourselves so this test stays correct as the
+        # team default changes over time.
         os.environ.pop("DEFAULT_TAB_CONCURRENCY", None)
+        expected = int(concurrency_mod._load_dotenv()["DEFAULT_TAB_CONCURRENCY"])
         importlib.reload(concurrency_mod)
-        self.assertEqual(concurrency_mod.DEFAULT_TAB_CONCURRENCY, 2)
+        self.assertEqual(concurrency_mod.DEFAULT_TAB_CONCURRENCY, expected)
 
     def test_env_var_overrides_default(self):
         self.assertEqual(_reload({"DEFAULT_TAB_CONCURRENCY": "5"}), 5)
