@@ -292,8 +292,10 @@ class BrowserIAAIClient:
                             browser.get(IAAI_SEARCH_URL, new_tab=True), timeout=30.0,
                         )
                         await asyncio.sleep(WAIT_LONG)
+                        # Always clear: IAAI restores prior filters from the
+                        # Chrome profile session (sticky between runs and tabs).
                         results[idx] = await self._scrape_one(
-                            tab, filters, clear_filters=False,
+                            tab, filters, clear_filters=True,
                         )
                     except Exception as exc:
                         print(f"[!] Error on filter set {idx + 1}: {exc}", flush=True)
