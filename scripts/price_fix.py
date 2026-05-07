@@ -93,12 +93,18 @@ def lookup_lots(
     client: bidfax.BidfaxClient | None = None,
     max_concurrent: int = bidfax.DEFAULT_TAB_CONCURRENCY,
     makes: dict[str, str] | None = None,
+    cache_path: Path | None = None,
 ) -> dict[str, tuple[str, str, str]]:
     """Re-fetch bidfax data for each lot. Returns only lots with a result URL.
 
     `makes` supplies the expected Make for URL validation; when the first
     bidfax hit belongs to a different make the client now returns
     IN_PROGRESS (treated as not-found here) rather than polluting the CSVs.
+
+    Successful (non-IN_PROGRESS) results are written into `cache_path` so
+    later daily/refresh runs hit the cache instead of re-querying bidfax —
+    a re-query risks running into bidfax's soft-block (homepage redirect
+    with a generic "empty search" alert) and losing the price we just got.
     """
     real_client = client or bidfax.BrowserBidfaxClient(browser_port=browser_port)
     fetched     = real_client.lookup_many(
@@ -112,6 +118,14 @@ def lookup_lots(
             print(f"  [bidfax] {lot} — {price}  VIN:{vin or '—'}  {url}")
         else:
             print(f"  [bidfax] {lot} — not found, SKIPPED")
+
+    if cache_path is not None and results:
+        cache = bidfax.load_cache(cache_path)
+        cache.update({lot: v for lot, v in results.items()
+                      if v[0] != bidfax.IN_PROGRESS})
+        bidfax.save_cache(cache_path, cache)
+        print(f"[+] Cached {len(results)} bidfax result(s) → {cache_path.name}")
+
     return results
 
 
@@ -311,6 +325,9 @@ def main() -> None:
     parser.add_argument("--concurrent",     type=int, default=bidfax.DEFAULT_TAB_CONCURRENCY,
                         help=f"Parallel bidfax tabs (default: {bidfax.DEFAULT_TAB_CONCURRENCY}; "
                              f"override via DEFAULT_TAB_CONCURRENCY env var or .env file)")
+    parser.add_argument("--cache",    "-c", default="caches/bidfax_cache.json",
+                        help="Cache file to update with re-fetched results "
+                             "(default: caches/bidfax_cache.json)")
     args = parser.parse_args()
 
     lots = _parse_lots(args.lots)
@@ -338,7 +355,8 @@ def main() -> None:
               f"— bidfax will accept whatever it returns for these")
 
     results = lookup_lots(lots, args.delay, args.browser_port,
-                          max_concurrent=args.concurrent, makes=makes)
+                          max_concurrent=args.concurrent, makes=makes,
+                          cache_path=Path(args.cache))
 
     missing = [l for l in lots if l not in results]
     if missing:

@@ -177,6 +177,28 @@ class TestPriceFix(unittest.TestCase):
         )
         self.assertEqual(seen_makes, {"33333333": "AUDI"})
 
+    def test_lookup_lots_writes_results_to_cache(self):
+        """Successful results must be written to bidfax_cache.json so a
+        later daily/refresh run doesn't re-query bidfax and risk a soft-block.
+        Regression: prior versions skipped the cache update entirely."""
+        cache_path = self.work_dir / "bidfax_cache.json"
+        fake = FakeBidfaxClient(responses={
+            "22222222": ("$17,500", "VINB",
+                         "https://bidfax.info/honda/cr-v/b-vin-vinb.html"),
+            # 33333333 → no response → not cached
+        })
+        price_fix.lookup_lots(
+            ["22222222", "33333333"], delay=0, browser_port=None,
+            client=fake, cache_path=cache_path,
+        )
+        from clients import bidfax as _bidfax
+        cached = _bidfax.load_cache(cache_path)
+        self.assertIn("22222222", cached)
+        self.assertEqual(cached["22222222"][0], "$17,500")
+        # Lots without a bidfax URL must NOT be cached (cache only stores
+        # confirmed prices, never IN_PROGRESS).
+        self.assertNotIn("33333333", cached)
+
 
 if __name__ == "__main__":
     unittest.main()

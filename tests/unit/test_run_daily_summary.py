@@ -93,25 +93,19 @@ class TestTimingSection(unittest.TestCase):
 
     def test_timing_block_renders_per_section(self):
         # At least one recorded result is needed for _print_summary to render.
-        run_daily._record(run_daily.STEP_COPART_SEARCH,  "ok")
-        run_daily._record(run_daily.STEP_IAAI_SEARCH,    "ok")
-        run_daily._record(run_daily.STEP_BIDFAX_COPART,  "ok")
-        run_daily._record(run_daily.STEP_BIDFAX_IAAI,    "ok")
-        run_daily._record(run_daily.STEP_PRICE_REFRESH,  "ok")
+        run_daily._record(run_daily.STEP_COPART_SEARCH, "ok")
+        run_daily._record(run_daily.STEP_IAAI_SEARCH,   "ok")
+        run_daily._record(run_daily.STEP_BIDFAX_RUN,    "ok")
 
         run_daily._step_timings.update({
             run_daily.STEP_COPART_SEARCH:  60.0,
             run_daily.STEP_IAAI_SEARCH:   120.0,
-            run_daily.STEP_BIDFAX_COPART:  90.0,
-            run_daily.STEP_BIDFAX_IAAI:    60.0,
-            run_daily.STEP_PRICE_REFRESH:  30.0,
+            run_daily.STEP_BIDFAX_RUN:    180.0,
         })
         run_daily._car_counts.update({
-            run_daily.STEP_COPART_SEARCH:   4,
-            run_daily.STEP_IAAI_SEARCH:     8,
-            run_daily.STEP_BIDFAX_COPART:  10,
-            run_daily.STEP_BIDFAX_IAAI:     8,
-            run_daily.STEP_PRICE_REFRESH:   6,
+            run_daily.STEP_COPART_SEARCH:  4,
+            run_daily.STEP_IAAI_SEARCH:    8,
+            run_daily.STEP_BIDFAX_RUN:    24,
         })
 
         buf = io.StringIO()
@@ -128,7 +122,7 @@ class TestTimingSection(unittest.TestCase):
         self.assertIn("4 cars",        out)
         self.assertIn("IAAI search",   out)
         self.assertIn("8 cars",        out)
-        # Bidfax aggregates the 3 sub-steps: 90+60+30 = 180s, 10+8+6 = 24 lots
+        # Bidfax is now a single consolidated step: 180s, 24 lots
         self.assertIn("Bidfax",        out)
         self.assertIn("24 cars",       out)
         # 180s / 24 = 7.5s per car

@@ -206,45 +206,12 @@ class TestQueryWithRetriesMakeValidation(unittest.IsolatedAsyncioTestCase):
     async def _fake_page_get(self, _url):  # noqa: ARG004
         await _REAL_ASYNCIO_SLEEP(0)
 
-    async def test_bounce_then_success_is_recovered(self):
-        """If the first attempt bounces but the second returns a valid
-        result, _query_with_retries must surface the success — transient
-        reCAPTCHA bounces shouldn't cost us the lot."""
-        import clients.bidfax as bf
-
-        # _search_once returns coroutines: first raise BidfaxBounce, then
-        # return the real result on the next call.
-        attempts = {"n": 0}
-        async def fake_search_once(_page, q):
-            await _REAL_ASYNCIO_SLEEP(0)
-            attempts["n"] += 1
-            if attempts["n"] == 1:
-                raise bf._BidfaxBounce(q)
-            return ("$8,600", "WA1XX", "https://bidfax.info/audi/q5/x.html")
-
-        orig_search = bf._search_once
-        orig_wait   = bf._wait_cf_clear
-        orig_sleep  = bf.asyncio.sleep
-        bf._search_once   = fake_search_once
-        bf._wait_cf_clear = self._no_op_async
-        bf.asyncio.sleep  = self._no_op_async
-        try:
-            class FakePage:
-                get = self._fake_page_get
-            result = await bf._query_with_retries(FakePage(), "44628574", "AUDI")
-        finally:
-            bf._search_once   = orig_search
-            bf._wait_cf_clear = orig_wait
-            bf.asyncio.sleep  = orig_sleep
-
-        self.assertEqual(result[0], "$8,600")
-        self.assertEqual(attempts["n"], 2)   # bounced once, succeeded on retry
-
-    async def test_bounce_uses_single_short_backoff_then_gives_up(self):
-        """We deliberately keep bounce retries minimal — one retry after
-        a 5-second pause. Server bounces to homepage both for missing lots
-        AND for rate-limited submissions; we can't tell them apart, so we
-        just take one cheap shot at recovering and bail otherwise."""
+    async def test_bounce_does_not_retry(self):
+        """Bounces must not be retried — see `_BOUNCE_MAX_ATTEMPTS` comment.
+        A second query from the same session almost always deepens the
+        soft-block, costing a screenshot and another bidfax hit for nothing.
+        Surface IN_PROGRESS once and let a future cleaner-session run pick
+        it up."""
         import clients.bidfax as bf
 
         attempts = {"n": 0}
@@ -273,48 +240,12 @@ class TestQueryWithRetriesMakeValidation(unittest.IsolatedAsyncioTestCase):
             bf._wait_cf_clear = orig_wait
             bf.asyncio.sleep  = orig_sleep
 
-        # We try exactly twice (one initial + one retry) and stop.
-        self.assertEqual(attempts["n"], bf._BOUNCE_MAX_ATTEMPTS)
+        # Exactly one attempt — no retry.
+        self.assertEqual(attempts["n"], 1)
+        self.assertEqual(bf._BOUNCE_MAX_ATTEMPTS, 1)
         self.assertEqual(result, (IN_PROGRESS, "", ""))
-        # The single retry waits exactly _BOUNCE_RETRY_WAIT seconds.
-        self.assertIn(bf._BOUNCE_RETRY_WAIT, captured_sleeps)
-
-    async def test_bounce_then_success_recovers_after_one_retry(self):
-        """The single bounce retry must rescue transient rate-limit cases
-        — bounce once, wait the configured pause, succeed on second try."""
-        import clients.bidfax as bf
-
-        attempts = {"n": 0}
-        async def bounce_then_succeed(_page, q):
-            await _REAL_ASYNCIO_SLEEP(0)
-            attempts["n"] += 1
-            if attempts["n"] == 1:
-                raise bf._BidfaxBounce(q)
-            return ("$1,234", "VIN", "https://bidfax.info/lincoln/corsair/x.html")
-
-        captured_sleeps: list[float] = []
-        async def recording_sleep(s):
-            await _REAL_ASYNCIO_SLEEP(0)
-            captured_sleeps.append(s)
-
-        orig_search = bf._search_once
-        orig_wait   = bf._wait_cf_clear
-        orig_sleep  = bf.asyncio.sleep
-        bf._search_once   = bounce_then_succeed
-        bf._wait_cf_clear = self._no_op_async
-        bf.asyncio.sleep  = recording_sleep
-        try:
-            class FakePage:
-                get = self._fake_page_get
-            result = await bf._query_with_retries(FakePage(), "Q", "LINCOLN")
-        finally:
-            bf._search_once   = orig_search
-            bf._wait_cf_clear = orig_wait
-            bf.asyncio.sleep  = orig_sleep
-
-        self.assertEqual(result[0], "$1,234")
-        # The retry wait was paid exactly once (between bounce 1 and the success).
-        self.assertEqual(captured_sleeps.count(bf._BOUNCE_RETRY_WAIT), 1)
+        # The retry-wait sleep must NOT have been entered (regression guard).
+        self.assertNotIn(bf._BOUNCE_RETRY_WAIT, captured_sleeps)
 
 
 class TestLogLookupResult(unittest.TestCase):

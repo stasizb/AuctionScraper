@@ -429,6 +429,26 @@ def _dump_token_missing(query: str, html: str) -> None:
               flush=True)
 
 
+async def _save_query_screenshot(page, query: str) -> None:
+    """Snap the bidfax page after each query attempt — for debugging cases
+    like 'bidfax returns empty for a lot we know it has'.
+
+    One file per try (timestamped), so a lot that retried 3 times produces
+    3 distinct screenshots. Errors are swallowed — must never break lookup.
+    """
+    from datetime import datetime
+    log_dir = Path(__file__).resolve().parent.parent / "logs"
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]   # ms precision
+    path = log_dir / f"bidfax_screenshot_{query}_{ts}.png"
+    try:
+        log_dir.mkdir(exist_ok=True)
+        await page.save_screenshot(filename=str(path), format="png", full_page=True)
+        print(f"    [bidfax] screenshot for {query} → {path.name}", flush=True)
+    except Exception as exc:
+        print(f"    [bidfax] [warn] screenshot failed for {query}: {exc}",
+              flush=True)
+
+
 def _dump_empty_search(query: str, html: str) -> None:
     """Save a snippet of the page when bidfax search came back empty.
 
@@ -644,47 +664,52 @@ async def _search_once(page, query: str) -> tuple[str, str, str]:
     after submit (reCAPTCHA score too low / rate-limit). The caller can
     decide whether to retry with a fresh page.
     """
-    if not await _fill_and_submit(page, query):
+    try:
+        if not await _fill_and_submit(page, query):
+            return IN_PROGRESS, "", ""
+        if not await _wait_for_navigation(page):
+            return IN_PROGRESS, "", ""
+
+        polls_after_cf = 0
+        last_html      = ""
+        for _ in range(_TOTAL_POLL_HARD_CAP):
+            await asyncio.sleep(1)
+            last_html = await page.get_content()
+            if "cf_chl" in last_html:
+                continue
+            result = extract_grid_result(last_html)
+            if result is not None:
+                return result
+            # Page came back as the homepage → server rejected the submission.
+            # Save a snapshot then signal the caller; transient bounces are
+            # often rescued by a fresh page navigation + fresh reCAPTCHA token.
+            if _HOMEPAGE_MARKER in last_html:
+                _dump_empty_search(query, last_html)
+                raise _BidfaxBounce(query)
+            polls_after_cf += 1
+            if polls_after_cf >= _GRID_POLL_BUDGET:
+                break
+
+        # Search reached this point with CF cleared but no grid result —
+        # most likely bidfax has nothing for `query`, but it could also be a
+        # page-shape change (different result-URL pattern, missing #grid). Dump
+        # a snippet so the next failure is debuggable instead of silent.
+        _dump_empty_search(query, last_html)
         return IN_PROGRESS, "", ""
-    if not await _wait_for_navigation(page):
-        return IN_PROGRESS, "", ""
-
-    polls_after_cf = 0
-    last_html      = ""
-    for _ in range(_TOTAL_POLL_HARD_CAP):
-        await asyncio.sleep(1)
-        last_html = await page.get_content()
-        if "cf_chl" in last_html:
-            continue
-        result = extract_grid_result(last_html)
-        if result is not None:
-            return result
-        # Page came back as the homepage → server rejected the submission.
-        # Save a snapshot then signal the caller; transient bounces are
-        # often rescued by a fresh page navigation + fresh reCAPTCHA token.
-        if _HOMEPAGE_MARKER in last_html:
-            _dump_empty_search(query, last_html)
-            raise _BidfaxBounce(query)
-        polls_after_cf += 1
-        if polls_after_cf >= _GRID_POLL_BUDGET:
-            break
-
-    # Search reached this point with CF cleared but no grid result —
-    # most likely bidfax has nothing for `query`, but it could also be a
-    # page-shape change (different result-URL pattern, missing #grid). Dump
-    # a snippet so the next failure is debuggable instead of silent.
-    _dump_empty_search(query, last_html)
-    return IN_PROGRESS, "", ""
+    finally:
+        # Snap the page on every exit (success, empty, bounce, raised exc)
+        # so we have a visual record of what bidfax actually rendered.
+        await _save_query_screenshot(page, query)
 
 
-# Cap on attempts per failure mode. Bounces are kept short because they
-# usually mean "bidfax doesn't have this lot" (server bounces to homepage
-# both for missing lots and for rate-limited submissions; we can't tell
-# them apart from a single response). Wasting many retries on a not-found
-# lot just delays the rest of the batch. One quick retry catches the
-# transient rate-limit case without paying a big cost when it doesn't.
-_BOUNCE_MAX_ATTEMPTS    = 2     # initial + 1 retry
-_BOUNCE_RETRY_WAIT      = 5.0   # seconds before the single retry
+# Cap on attempts per failure mode. Bounces are NOT retried — when bidfax
+# returns the homepage with the generic "empty search" alert, it's almost
+# always a soft-block (rate limit / reCAPTCHA score depletion) and a second
+# query from the same session goes deeper into the soft-block, not out of
+# it. Better to surface IN_PROGRESS once and let a future, cleaner-session
+# run pick it up than to waste a retry that risks blocking the whole batch.
+_BOUNCE_MAX_ATTEMPTS    = 1     # initial only — no retry
+_BOUNCE_RETRY_WAIT      = 5.0   # unused while MAX_ATTEMPTS=1, kept for tests
 
 # Make-mismatch retries are different — bidfax DID accept the search and
 # returned a result, just for the wrong vehicle. Retrying often surfaces
@@ -717,12 +742,11 @@ async def _query_with_retries(page, query: str, expected_make: str) -> tuple[str
         except _BidfaxBounce:
             bounce_attempts += 1
             if bounce_attempts >= _BOUNCE_MAX_ATTEMPTS:
-                print(f"    [bidfax] {query!r}: bounced again — giving up "
-                      f"(treat as not on bidfax)", flush=True)
+                print(f"    [bidfax] {query!r}: server bounced back to "
+                      f"homepage (soft-block / not indexed) — "
+                      f"surfacing IN_PROGRESS without retry "
+                      f"(see _BOUNCE_MAX_ATTEMPTS comment)", flush=True)
                 return IN_PROGRESS, "", ""
-            print(f"    [bidfax] {query!r}: server bounced back to homepage "
-                  f"(reCAPTCHA / rate limit) — retrying once after "
-                  f"{_BOUNCE_RETRY_WAIT:.0f}s", flush=True)
             await asyncio.sleep(_BOUNCE_RETRY_WAIT)
             continue
 

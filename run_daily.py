@@ -13,14 +13,15 @@ Execution is split into three phases to exploit available parallelism:
     Step 3 only needs step 1's output, so it chains right after — no
     reason to make it wait for the slower IAAI scrape to finish.
 
-  Phase 2 (sequential) — runs after phase 1 completes
-    5. bidfax_info.py iaai   — bidfax prices for yesterday's IAAI lots (browser)
+  Phase 2 (sequential) — single bidfax browser session for everything
+    4. bidfax_run.py         — sale-ended check (Copart) + bidfax lookup
+                               (today's Copart-ended + today's IAAI) +
+                               refresh of In Progress prices (all price CSVs +
+                               workbook). One fresh Chrome, multi-tab.
 
-  Phase 3 (sequential) — steps share bidfax_cache.json / auction_results.xlsx
-    4. bidfax_info.py copart — check Sale ended + bidfax prices for yesterday's Copart lots
-    6. price_refresh.py      — retry all In Progress lots across all price CSVs
-    7. build_workbook.py     — aggregate price CSVs into Excel workbook
-    8. workbook_to_html.py   — generate HTML report from workbook
+  Phase 3 (sequential) — steps share auction_results.xlsx
+    5. build_workbook.py     — aggregate price CSVs into Excel workbook
+    6. workbook_to_html.py   — generate HTML report from workbook
 
 Directory layout expected next to the scripts:
     filters/   — copart_filters.csv, iaai_filters.csv
@@ -137,11 +138,9 @@ _car_counts:   dict[str, int]   = {}
 STEP_COPART_SEARCH      = "1. Copart search (today)"
 STEP_IAAI_SEARCH        = "2. IAAI search (today)"
 STEP_REMOVE_DUPLICATES  = "3. Remove Copart duplicates (yesterday vs today)"
-STEP_BIDFAX_COPART      = "4. Bidfax prices — Copart (yesterday)"
-STEP_BIDFAX_IAAI        = "5. Bidfax prices — IAAI (yesterday)"
-STEP_PRICE_REFRESH      = "6. Refresh In Progress prices"
-STEP_BUILD_WORKBOOK     = "7. Build Excel workbook"
-STEP_HTML_REPORT        = "8. Generate HTML report"
+STEP_BIDFAX_RUN         = "4. Bidfax pipeline (sale-ended + lookup + refresh)"
+STEP_BUILD_WORKBOOK     = "5. Build Excel workbook"
+STEP_HTML_REPORT        = "6. Generate HTML report"
 
 
 def _record(name: str, status: str, detail: str = "") -> None:
@@ -289,9 +288,9 @@ def _count_csv_rows(path: Path) -> int:
 
 def _count_in_progress(output_dir: Path) -> int:
     """Count rows whose Price column is 'In Progress' across every
-    `<auction>_price_<date>.csv` in `output_dir`. This is the input size
-    for step 6 (price_refresh) — sampled before the step runs so the
-    summary's 'time per car' is meaningful."""
+    `<auction>_price_<date>.csv` in `output_dir`. Used as part of the
+    step 4 (bidfax pipeline) input-size estimate, sampled before the step
+    runs so the timing summary's 'time per car' is meaningful."""
     total = 0
     for path in sorted(output_dir.glob("*_price_*.csv")):
         try:
@@ -348,7 +347,7 @@ def _print_timing_section() -> None:
     sections: list[tuple[str, list[str]]] = [
         ("Copart search", [STEP_COPART_SEARCH]),
         ("IAAI search",   [STEP_IAAI_SEARCH]),
-        ("Bidfax",        [STEP_BIDFAX_COPART, STEP_BIDFAX_IAAI, STEP_PRICE_REFRESH]),
+        ("Bidfax",        [STEP_BIDFAX_RUN]),
     ]
     label_width = max(len(label) for label, _ in sections)
     for label, step_keys in sections:
@@ -406,15 +405,18 @@ def main() -> None:
         copart_date = _find_recent_search(output, "copart", _yesterday)
         iaai_date   = _find_recent_search(output, "iaai",   _yesterday)
 
-        # Bidfax-step inputs come from yesterday's search CSVs — record
-        # those counts now so the timing summary has them even if a step
-        # fails mid-run.
+        # Bidfax queue size = yesterday's Copart input + yesterday's IAAI input
+        # + In Progress rows from older price CSVs. Sampled now (pre-run) so
+        # the timing summary has the count even if the step fails mid-run.
+        bidfax_input_count = 0
         if copart_date:
-            _car_counts[STEP_BIDFAX_COPART] = _count_csv_rows(
+            bidfax_input_count += _count_csv_rows(
                 output / f"copart_search_{copart_date}.csv")
         if iaai_date:
-            _car_counts[STEP_BIDFAX_IAAI] = _count_csv_rows(
+            bidfax_input_count += _count_csv_rows(
                 output / f"iaai_search_{iaai_date}.csv")
+        bidfax_input_count += _count_in_progress(output)
+        _car_counts[STEP_BIDFAX_RUN] = bidfax_input_count
 
         # ---- Phase 1 (parallel chains) -----------------------------------
         # Chain A: copart_search → remove_duplicates. Step 3 only needs
@@ -453,55 +455,25 @@ def main() -> None:
         _car_counts[STEP_COPART_SEARCH] = _count_csv_rows(output / f"copart_search_{today}.csv")
         _car_counts[STEP_IAAI_SEARCH]   = _count_csv_rows(output / f"iaai_search_{today}.csv")
 
-        # ---- Phase 2 (sequential): IAAI bidfax for yesterday -------------
-        # Step 3 used to live here alongside step 5; with step 3 chained
-        # into phase 1, only step 5 remains.
-        if iaai_date:
-            run(STEP_BIDFAX_IAAI, [
-                py, s("bidfax_info.py"),
-                "--auction", "iaai",
-                "--date",    iaai_date,
-                "--dir",     str(output),
-                "--cache",   bidfax_cache,
-                "--log",     str(logs / "bidfax_deletions.json"),
-                *bp,
-            ])
-        else:
-            skip(STEP_BIDFAX_IAAI, "no recent iaai search file found")
-
-        # ---- Phase 3 (sequential): Copart bidfax → refresh → workbook → HTML
-        # Steps 4, 6, 7, 8 share bidfax_cache.json and/or auction_results.xlsx;
-        # they must remain sequential.
-        if copart_date:
-            run(STEP_BIDFAX_COPART, [
-                py, s("bidfax_info.py"),
-                "--auction", "copart",
-                "--date",    copart_date,
-                "--dir",     str(output),
-                "--cache",   bidfax_cache,
-                "--log",     str(logs / "bidfax_deletions.json"),
-                *bp,
-            ])
-        else:
-            skip(STEP_BIDFAX_COPART, "no recent copart search file found")
-
-        # Step 6's input is "all In-Progress rows in price CSVs at this
-        # moment" — sample it before the step runs so the timing summary's
-        # 'time per car' is meaningful (after the step, those rows are
-        # priced and the count would be ~0).
-        _car_counts[STEP_PRICE_REFRESH] = _count_in_progress(output)
-
-        # Step 6 deliberately does NOT use the shared Chrome (no --browser-port).
-        # The shared session accumulates bidfax cookies / reCAPTCHA score from
-        # step 4 + step 5; if those are throttled when step 6 starts, every
-        # query bounces. Spawning a fresh Chrome here gives price_refresh a
-        # clean session, restoring the recovery rate to standalone-run levels.
-        run(STEP_PRICE_REFRESH, [
-            py, s("price_refresh.py"),
+        # ---- Phase 2 (sequential): consolidated bidfax pipeline ----------
+        # bidfax_run.py owns sale-ended check + bidfax lookup (Copart-ended +
+        # today's IAAI) + In-Progress refresh + workbook updates inside one
+        # asyncio.run + one fresh Chrome (no --browser-port). The fresh
+        # browser is deliberate: prior split steps shared the daily Chrome
+        # and accumulated bidfax cookies / Cloudflare score across phases,
+        # which throttled later queries.
+        bidfax_args = [
+            py, s("bidfax_run.py"),
             "--dir",      str(output),
             "--cache",    bidfax_cache,
+            "--log",      str(logs / "bidfax_deletions.json"),
             "--workbook", workbook,
-        ])
+        ]
+        if copart_date:
+            bidfax_args += ["--copart-date", copart_date]
+        if iaai_date:
+            bidfax_args += ["--iaai-date", iaai_date]
+        run(STEP_BIDFAX_RUN, bidfax_args)
 
         run(STEP_BUILD_WORKBOOK, [
             py, s("build_workbook.py"),
