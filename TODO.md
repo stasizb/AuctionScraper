@@ -16,10 +16,13 @@
       launches Chrome more than once per script run (or per daily pipeline)
       and whether the sessions can be consolidated into one.
 
-- [ ] Remove too-old lots without a price from the workbook. Lots that have
-      sat past their auction date with no resolved bidfax price are stale —
-      define a cutoff (days since auction?) and prune them so the workbook
-      doesn't grow unbounded.
+- [x] Remove too-old lots without a price from the workbook.
+      Done: `bidfax_run.py` deletes In-Progress rows whose Auction Date is
+      more than `--stale-cutoff-days` days old (default 7) from price CSVs
+      AND the workbook. Pure date helpers (`_parse_auction_date`,
+      `_is_stale`) are conservative — unparseable dates never trigger
+      deletion. Stale lots are also dropped from the bidfax queue so we
+      don't waste a query on rows we're about to delete.
 
 - [x] Group messages from concurrent threads/tabs in the logs.
       Done: `core/job_log.py` installs a contextvars-aware sys.stdout proxy;

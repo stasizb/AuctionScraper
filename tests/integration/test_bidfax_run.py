@@ -26,7 +26,7 @@ def _write_search_csv(path: Path, rows: list[dict]) -> None:
 
 def _write_price_csv(path: Path, rows: list[dict]) -> None:
     fieldnames = ["Make", "Model", "Year", "Odometer", "Price",
-                  "Lot Number", "Link", "VIN"]
+                  "Lot Number", "Link", "Auction Date", "VIN"]
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -214,6 +214,146 @@ class TestEmptyPipeline(unittest.TestCase):
             )
             # Nothing more to assert — this guards against KeyError / crash
             # when the queue is empty.
+
+
+class TestStalenessHelpers(unittest.TestCase):
+    """Pure-function unit tests for the date helpers — these decide which
+    rows get pruned, so subtle parsing bugs would silently delete data."""
+
+    def test_parse_iaai_format_with_utc_suffix(self):
+        from datetime import date as _date
+        d = bidfax_run._parse_auction_date("2026-05-06 13:30 UTC")
+        self.assertEqual(d, _date(2026, 5, 6))
+
+    def test_parse_bare_date_no_time(self):
+        from datetime import date as _date
+        d = bidfax_run._parse_auction_date("2026-05-06")
+        self.assertEqual(d, _date(2026, 5, 6))
+
+    def test_parse_handles_other_timezone_suffixes(self):
+        # Field has carried EST / CST in the past; helper must strip those
+        # too rather than refuse to parse and accidentally label as fresh.
+        from datetime import date as _date
+        for tail in (" EST", " CDT", " GMT"):
+            d = bidfax_run._parse_auction_date("2026-05-06 13:30" + tail)
+            self.assertEqual(d, _date(2026, 5, 6), f"failed for tail={tail!r}")
+
+    def test_parse_unknown_garbage_returns_none(self):
+        self.assertIsNone(bidfax_run._parse_auction_date("not a date"))
+        self.assertIsNone(bidfax_run._parse_auction_date(""))
+        self.assertIsNone(bidfax_run._parse_auction_date(None))
+
+    def test_is_stale_strict_inequality(self):
+        # Cutoff = 7 means *more than* 7 days old → stale. Day 7 itself
+        # is the boundary and must NOT be stale (refreshed yesterday).
+        from datetime import date as _date
+        today = _date(2026, 5, 7)
+        self.assertFalse(bidfax_run._is_stale("2026-04-30 13:30 UTC", 7, today))  # exactly 7d
+        self.assertTrue (bidfax_run._is_stale("2026-04-29 13:30 UTC", 7, today))  # 8d
+        self.assertFalse(bidfax_run._is_stale("2026-05-06 13:30 UTC", 7, today))  # 1d
+        self.assertFalse(bidfax_run._is_stale("2026-05-07 13:30 UTC", 7, today))  # today
+
+    def test_is_stale_unparseable_is_never_stale(self):
+        # Defensive: a malformed date must NOT cause data loss.
+        from datetime import date as _date
+        today = _date(2026, 5, 7)
+        self.assertFalse(bidfax_run._is_stale("???", 7, today))
+        self.assertFalse(bidfax_run._is_stale("", 7, today))
+
+
+class TestStalePruning(unittest.TestCase):
+    """Integration: stale In-Progress rows are deleted from CSVs (and not
+    re-queued for bidfax), recent rows still go through the refresh path."""
+
+    def test_stale_rows_pruned_from_csv_recent_rows_refreshed(self):
+        from datetime import date as _date
+        with tempfile.TemporaryDirectory() as tmp:
+            work  = Path(tmp)
+            cache = work / "cache.json"
+            log   = work / "del.json"
+
+            old_price = work / "iaai_price_2026_04_01.csv"
+            # Three In-Progress rows: 1 stale (>7d), 1 recent (<=7d), 1 priced.
+            _write_price_csv(old_price, [
+                {"Make": "AUDI", "Model": "Q5", "Year": "2024",
+                 "Odometer": "8000", "Price": IN_PROGRESS,
+                 "Lot Number": "111", "Link": "https://iaai/lot/111",
+                 "Auction Date": "2026-04-01 13:30 UTC", "VIN": ""},   # >>7d
+                {"Make": "AUDI", "Model": "Q5", "Year": "2024",
+                 "Odometer": "9000", "Price": IN_PROGRESS,
+                 "Lot Number": "222", "Link": "https://iaai/lot/222",
+                 "Auction Date": "2026-05-04 13:30 UTC", "VIN": ""},   # 3d
+                {"Make": "AUDI", "Model": "Q5", "Year": "2024",
+                 "Odometer": "8500", "Price": "$25,000",
+                 "Lot Number": "333", "Link": "https://iaai/lot/333",
+                 "Auction Date": "2026-04-01 13:30 UTC", "VIN": "ABC"},  # priced
+            ])
+
+            fake = FakeBidfaxClient(responses={
+                "222": ("$30,000", "VINR", "https://bidfax/222.html"),
+            })
+
+            bidfax_run.process(
+                work_dir          = work,
+                cache_path        = cache,
+                log_path          = log,
+                workbook_path     = None,
+                delay             = 0.0,
+                max_concurrent    = 1,
+                copart_date       = None,
+                iaai_date         = None,
+                bidfax_client     = fake,
+                stale_cutoff_days = 7,
+                today             = _date(2026, 5, 7),
+            )
+
+            with old_price.open() as fh:
+                rows = list(csv.DictReader(fh))
+            lots = [r["Lot Number"] for r in rows]
+            self.assertNotIn("111", lots)               # stale → pruned
+            self.assertIn("222", lots)                  # recent → kept
+            self.assertIn("333", lots)                  # priced → untouched
+            by_lot = {r["Lot Number"]: r for r in rows}
+            self.assertEqual(by_lot["222"]["Price"], "$30,000")
+            self.assertEqual(by_lot["333"]["Price"], "$25,000")
+
+            # Bidfax was queried only for the recent lot, never the stale one.
+            self.assertEqual(set(fake.lookup_calls), {"222"})
+
+    def test_pruning_only_pipeline_does_not_touch_bidfax(self):
+        # When EVERY in-progress row is stale, queue is empty — but the
+        # script still has work (delete the stale rows) and must not exit
+        # early before saving the cleaned-up files.
+        from datetime import date as _date
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            old_price = work / "iaai_price_2026_04_01.csv"
+            _write_price_csv(old_price, [
+                {"Make": "AUDI", "Model": "Q5", "Year": "2024",
+                 "Odometer": "8000", "Price": IN_PROGRESS,
+                 "Lot Number": "111", "Link": "https://iaai/lot/111",
+                 "Auction Date": "2026-04-01 13:30 UTC", "VIN": ""},
+            ])
+            fake = FakeBidfaxClient()
+
+            bidfax_run.process(
+                work_dir          = work,
+                cache_path        = work / "cache.json",
+                log_path          = work / "del.json",
+                workbook_path     = None,
+                delay             = 0.0,
+                max_concurrent    = 1,
+                copart_date       = None,
+                iaai_date         = None,
+                bidfax_client     = fake,
+                stale_cutoff_days = 7,
+                today             = _date(2026, 5, 7),
+            )
+
+            with old_price.open() as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(rows, [])                  # row pruned
+            self.assertEqual(fake.lookup_calls, [])     # no bidfax calls
 
 
 if __name__ == "__main__":

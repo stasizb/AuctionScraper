@@ -25,6 +25,7 @@ Usage:
 import argparse
 import csv
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -74,6 +75,45 @@ class BidfaxJob:
     lot:          str
     make:         str
     destinations: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Staleness helpers
+# ---------------------------------------------------------------------------
+
+AUCTION_DATE_COL    = "Auction Date"
+DEFAULT_STALE_DAYS  = 7
+
+# IAAI auction dates land here as "YYYY-MM-DD HH:MM UTC". The trailing
+# timezone abbrev is informational; we only need the date for staleness
+# math, so strip whatever 3-4 letter zone tail is on it.
+_TZ_SUFFIX_RE = re.compile(r"\s+[A-Z]{2,4}\s*$")
+
+
+def _parse_auction_date(value) -> date | None:
+    """Return the date portion of an Auction Date cell, or None if it
+    can't be parsed. Defensive — a missing or malformed value must NOT
+    cause a stale match (we'd rather keep a row than wrongly delete it)."""
+    if value is None:
+        return None
+    s = _TZ_SUFFIX_RE.sub("", str(value).strip())
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _is_stale(auction_date_value, cutoff_days: int, today: date) -> bool:
+    """True iff the auction date is more than `cutoff_days` days before
+    `today`. Unparseable dates are never stale."""
+    parsed = _parse_auction_date(auction_date_value)
+    if parsed is None:
+        return False
+    return (today - parsed).days > cutoff_days
 
 
 # ---------------------------------------------------------------------------
@@ -173,15 +213,41 @@ def collect_iaai(
     return active
 
 
+def _classify_inprogress_row(
+    row: dict, cutoff_days: int, today: date,
+) -> tuple[str, str, bool] | None:
+    """Inspect one In-Progress price-CSV row. Returns None if the row
+    isn't In Progress or has no lot. Otherwise returns (lot, make, stale)
+    so the caller can decide whether to queue it for refresh or prune it.
+    """
+    if row.get(PRICE_COL, "").strip() != IN_PROGRESS:
+        return None
+    lot  = str(row.get(LOT_COL, "")).strip()
+    make = str(row.get(MAKE_COL, "")).strip()
+    if not lot:
+        return None
+    stale = _is_stale(row.get(AUCTION_DATE_COL, ""), cutoff_days, today)
+    return lot, make, stale
+
+
 def collect_inprogress_csvs(
     jobs:    dict[str, BidfaxJob],
     files:   list[Path],
-) -> dict[Path, tuple[list[str], list[dict]]]:
-    """Walk existing price CSVs; queue every In Progress row for refresh.
+    *,
+    cutoff_days: int = DEFAULT_STALE_DAYS,
+    today:       date | None = None,
+) -> tuple[dict[Path, tuple[list[str], list[dict]]], dict[Path, list[dict]]]:
+    """Walk price CSVs. Queue fresh In-Progress rows for refresh; flag
+    rows whose auction is older than `cutoff_days` for deletion (the
+    caller drops them in phase 3).
 
-    Returns the loaded file data so phase 3 can re-save modified files.
+    Returns (file_data, pruned) where:
+      file_data — {path: (fieldnames, rows)} — all loaded files
+      pruned    — {path: [row, ...]} — rows the file should NO LONGER contain
     """
+    today = today or date.today()
     file_data: dict[Path, tuple[list[str], list[dict]]] = {}
+    pruned:    dict[Path, list[dict]] = {}
     for path in files:
         fieldnames, rows = load_csv_dict(path)
         if PRICE_COL not in fieldnames:
@@ -189,40 +255,73 @@ def collect_inprogress_csvs(
             continue
         file_data[path] = (fieldnames, rows)
         for row in rows:
-            if row.get(PRICE_COL, "").strip() != IN_PROGRESS:
+            cls = _classify_inprogress_row(row, cutoff_days, today)
+            if cls is None:
                 continue
-            lot  = str(row.get(LOT_COL, "")).strip()
-            make = str(row.get(MAKE_COL, "")).strip()
-            if not lot:
+            lot, make, stale = cls
+            if stale:
+                pruned.setdefault(path, []).append(row)
+                print(f"[*] Prune stale lot {lot} from {path.name} "
+                      f"(auction {row.get(AUCTION_DATE_COL, '?')!s})")
                 continue
             job = _ensure_job(jobs, lot, make)
             job.destinations.append(_UpdateRowDest(path, row))
-    return file_data
+    return file_data, pruned
+
+
+def _scan_workbook_sheet(
+    ws, jobs: dict[str, BidfaxJob],
+    cutoff_days: int, today: date,
+) -> list[int]:
+    """Walk one sheet's In-Progress rows: queue fresh ones for refresh,
+    return the 1-based row indices of stale ones for the caller to delete.
+    Sheets without the required columns are skipped (empty list)."""
+    header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+    if not header or LOT_COL not in header or PRICE_COL not in header:
+        return []
+    headers   = list(header)
+    lot_i     = headers.index(LOT_COL)
+    price_i   = headers.index(PRICE_COL)
+    auct_i    = headers.index(AUCTION_DATE_COL) if AUCTION_DATE_COL in headers else None
+
+    stale: list[int] = []
+    for row_cells in ws.iter_rows(min_row=2):
+        if str(row_cells[price_i].value or "").strip() != IN_PROGRESS:
+            continue
+        lot = str(row_cells[lot_i].value or "").strip()
+        if not lot:
+            continue
+        ad_value = row_cells[auct_i].value if auct_i is not None else ""
+        if _is_stale(ad_value, cutoff_days, today):
+            stale.append(row_cells[0].row)
+            print(f"[*] Prune stale lot {lot} from workbook sheet "
+                  f"'{ws.title}' (auction {ad_value!s})")
+            continue
+        job = _ensure_job(jobs, lot, ws.title)
+        job.destinations.append(_WorkbookRowDest(ws.title, lot))
+    return stale
 
 
 def collect_inprogress_workbook(
     jobs:        dict[str, BidfaxJob],
     workbook_path: Path | None,
+    *,
+    cutoff_days: int = DEFAULT_STALE_DAYS,
+    today:       date | None = None,
 ):
-    """Open the workbook (if any), queue In Progress rows. Returns wb or None."""
+    """Open the workbook (if any). Queue fresh In-Progress rows for
+    refresh; return the wb plus a {sheet_name: [stale_row_indices]} map
+    so phase 3 can delete those rows."""
     if workbook_path is None or not workbook_path.exists():
-        return None
+        return None, {}
+    today = today or date.today()
     wb = openpyxl.load_workbook(workbook_path)
+    pruned: dict[str, list[int]] = {}
     for ws in wb.worksheets:
-        header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
-        if not header or LOT_COL not in header or PRICE_COL not in header:
-            continue
-        lot_i   = list(header).index(LOT_COL)
-        price_i = list(header).index(PRICE_COL)
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if str(row[price_i] or "").strip() != IN_PROGRESS:
-                continue
-            lot = str(row[lot_i] or "").strip()
-            if not lot:
-                continue
-            job = _ensure_job(jobs, lot, ws.title)
-            job.destinations.append(_WorkbookRowDest(ws.title, lot))
-    return wb
+        stale = _scan_workbook_sheet(ws, jobs, cutoff_days, today)
+        if stale:
+            pruned[ws.title] = stale
+    return wb, pruned
 
 
 # ---------------------------------------------------------------------------
@@ -319,16 +418,14 @@ def _build_new_row(src_row: dict, price: str, vin: str, url: str) -> dict:
     return row
 
 
-def distribute(
-    jobs:        dict[str, BidfaxJob],
-    results:     dict[str, tuple[str, str, str]],
-    file_data:   dict[Path, tuple[list[str], list[dict]]],
-    wb,
-) -> tuple[int, int]:
-    """Write each lot's result into its destinations. Returns (csv, wb) counts."""
+def _apply_jobs_to_destinations(
+    jobs:    dict[str, BidfaxJob],
+    results: dict[str, tuple[str, str, str]],
+) -> tuple[dict[Path, tuple[list[str], list[dict]]], int]:
+    """First pass over the queue: build per-output-path new-row buckets and
+    mutate UpdateRowDest rows in place. Returns (new_rows_by_path, csv_updates)."""
     new_rows_by_path: dict[Path, tuple[list[str], list[dict]]] = {}
     csv_updates = 0
-
     for lot, job in jobs.items():
         price, vin, url = results.get(lot, (IN_PROGRESS, "", ""))
         for dest in job.destinations:
@@ -339,12 +436,16 @@ def distribute(
                 bucket[1].append(_build_new_row(dest.src_row, price, vin, url))
             elif isinstance(dest, _UpdateRowDest):
                 if price == IN_PROGRESS:
-                    continue   # skip refresh writes for unresolved lots
+                    continue
                 _apply_to_existing_row(dest.row, price, vin, url)
                 csv_updates += 1
-            elif isinstance(dest, _WorkbookRowDest):
-                pass   # handled in workbook pass below
+            # _WorkbookRowDest is handled in _apply_workbook below.
+    return new_rows_by_path, csv_updates
 
+
+def _write_new_outputs(
+    new_rows_by_path: dict[Path, tuple[list[str], list[dict]]],
+) -> None:
     for out_path, (fieldnames, rows) in new_rows_by_path.items():
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with out_path.open("w", newline="", encoding="utf-8") as fh:
@@ -353,13 +454,72 @@ def distribute(
             writer.writerows(rows)
         print(f"[+] Wrote {len(rows)} row(s) → {out_path}")
 
+
+def _save_modified_existing_files(
+    file_data:  dict[Path, tuple[list[str], list[dict]]],
+    results:    dict[str, tuple[str, str, str]],
+    csv_pruned: dict[Path, list[dict]],
+) -> int:
+    """Drop pruned rows from each file and re-save when anything changed
+    (refresh update, prune, or both). Returns count of pruned rows."""
+    pruned_total = 0
+    for path, stale_rows in csv_pruned.items():
+        if path not in file_data:
+            continue
+        fieldnames, rows = file_data[path]
+        stale_ids = set(map(id, stale_rows))
+        rows[:]   = [r for r in rows if id(r) not in stale_ids]
+        pruned_total += len(stale_rows)
+
     for path, (fieldnames, rows) in file_data.items():
-        if any(_row_was_updated(r, results) for r in rows):
+        had_prune  = path in csv_pruned
+        had_update = any(_row_was_updated(r, results) for r in rows)
+        if had_prune or had_update:
             save_csv_dict(path, fieldnames, rows)
             print(f"[+] Updated → {path.name}")
+    return pruned_total
 
-    wb_updates = _apply_workbook(wb, results) if wb is not None else 0
-    return csv_updates, wb_updates
+
+def distribute(
+    jobs:        dict[str, BidfaxJob],
+    results:     dict[str, tuple[str, str, str]],
+    file_data:   dict[Path, tuple[list[str], list[dict]]],
+    wb,
+    *,
+    csv_pruned:  dict[Path, list[dict]] | None = None,
+    wb_pruned:   dict[str, list[int]]  | None = None,
+) -> tuple[int, int, int]:
+    """Write each lot's result into its destinations and apply pruning.
+
+    Returns (csv_updates, wb_updates, pruned_rows_total)."""
+    csv_pruned = csv_pruned or {}
+    wb_pruned  = wb_pruned  or {}
+
+    new_rows_by_path, csv_updates = _apply_jobs_to_destinations(jobs, results)
+    _write_new_outputs(new_rows_by_path)
+    pruned_csv = _save_modified_existing_files(file_data, results, csv_pruned)
+
+    wb_updates = 0
+    pruned_wb  = 0
+    if wb is not None:
+        wb_updates = _apply_workbook(wb, results)
+        pruned_wb  = _delete_workbook_rows(wb, wb_pruned)
+
+    return csv_updates, wb_updates, pruned_csv + pruned_wb
+
+
+def _delete_workbook_rows(wb, wb_pruned: dict[str, list[int]]) -> int:
+    """Remove the listed 1-based row indices from each sheet. Reverse-sort
+    inside each sheet so deletions don't shift later indices."""
+    total = 0
+    for sheet_name, indices in wb_pruned.items():
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        for idx in sorted(indices, reverse=True):
+            ws.delete_rows(idx)
+            total += 1
+    return total
 
 
 def _row_was_updated(row: dict, results: dict[str, tuple]) -> bool:
@@ -411,6 +571,93 @@ def _find_recent_search(directory: Path, auction: str, date_str: str,
 # Main
 # ---------------------------------------------------------------------------
 
+def _resolve_input_paths(
+    work_dir:    Path,
+    today:       date,
+    copart_date: str | None,
+    iaai_date:   str | None,
+) -> tuple[Path | None, Path | None, Path | None, Path | None]:
+    """Pin Copart + IAAI input/output paths for this run. Each returns
+    None when the corresponding search CSV can't be found."""
+    yesterday = (today - timedelta(days=1)).strftime("%Y_%m_%d")
+    cd  = copart_date or _find_recent_search(work_dir, "copart", yesterday)
+    id_ = iaai_date   or _find_recent_search(work_dir, "iaai",   yesterday)
+    copart_input  = work_dir / f"copart_search_{cd}.csv" if cd  else None
+    copart_output = work_dir / f"copart_price_{cd}.csv"  if cd  else None
+    iaai_input    = work_dir / f"iaai_search_{id_}.csv"  if id_ else None
+    iaai_output   = work_dir / f"iaai_price_{id_}.csv"   if id_ else None
+    return copart_input, copart_output, iaai_input, iaai_output
+
+
+def _phase_copart(
+    jobs:          dict[str, BidfaxJob],
+    copart_input:  Path | None,
+    copart_output: Path | None,
+    log_path:      Path,
+    bidfax_client: bidfax.BidfaxClient | None,
+    copart_date:   str | None,
+) -> None:
+    if copart_input is None or not copart_input.exists():
+        if copart_date is not None:
+            print(f"[!] Copart input not found for date {copart_date}")
+        return
+    _, raw_rows = _read_search_csv(copart_input)
+    active_rows = _filter_active_rows(raw_rows)
+    urls = [str(r.get("Link", "")).strip() for r in active_rows
+            if str(r.get("Link", "")).strip()]
+    print(f"[*] Sale-Ended check on {len(urls)} Copart lot(s)…")
+    sale_ended = run_sale_ended_check(urls, bidfax_client)
+    kept, deleted = collect_copart(jobs, copart_input, copart_output,
+                                   log_path, sale_ended)
+    print(f"[*] Copart: {len(kept)} ended → queued, "
+          f"{len(deleted)} not-ended → removed")
+
+
+def _phase_iaai(
+    jobs:        dict[str, BidfaxJob],
+    iaai_input:  Path | None,
+    iaai_output: Path | None,
+    iaai_date:   str | None,
+) -> None:
+    if iaai_input is None or not iaai_input.exists():
+        if iaai_date is not None:
+            print(f"[!] IAAI input not found for date {iaai_date}")
+        return
+    active = collect_iaai(jobs, iaai_input, iaai_output)
+    print(f"[*] IAAI: {len(active)} lot(s) → queued")
+
+
+def _phase_refresh(
+    jobs:              dict[str, BidfaxJob],
+    work_dir:          Path,
+    workbook_path:     Path | None,
+    stale_cutoff_days: int,
+    today:             date,
+):
+    """Scan price CSVs and workbook for In-Progress rows. Queue fresh
+    ones, mark stale ones for deletion. Returns
+    (file_data, csv_pruned, wb, wb_pruned)."""
+    files = find_price_files(work_dir, "all")
+    file_data, csv_pruned = collect_inprogress_csvs(
+        jobs, files, cutoff_days=stale_cutoff_days, today=today,
+    )
+    refresh_count = sum(1 for j in jobs.values()
+                        if any(isinstance(d, _UpdateRowDest) for d in j.destinations))
+    pruned_csv_total = sum(len(v) for v in csv_pruned.values())
+    print(f"[*] Refresh: {refresh_count} stale In Progress row(s) → queued, "
+          f"{pruned_csv_total} stale row(s) → pruned (cutoff "
+          f"{stale_cutoff_days} days)")
+
+    wb, wb_pruned = collect_inprogress_workbook(
+        jobs, workbook_path, cutoff_days=stale_cutoff_days, today=today,
+    )
+    pruned_wb_total = sum(len(v) for v in wb_pruned.values())
+    if wb is not None:
+        print(f"[*] Workbook: scanned for In Progress rows "
+              f"({pruned_wb_total} stale row(s) → will prune)")
+    return file_data, csv_pruned, wb, wb_pruned
+
+
 def process(
     work_dir:        Path,
     cache_path:      Path,
@@ -421,73 +668,46 @@ def process(
     copart_date:     str | None = None,
     iaai_date:       str | None = None,
     bidfax_client:   bidfax.BidfaxClient | None = None,
+    stale_cutoff_days: int = DEFAULT_STALE_DAYS,
+    today:           date | None = None,
 ) -> None:
-    yesterday = (date.today() - timedelta(days=1)).strftime("%Y_%m_%d")
-    cd = copart_date or _find_recent_search(work_dir, "copart", yesterday)
-    id_ = iaai_date  or _find_recent_search(work_dir, "iaai",   yesterday)
-
-    copart_input  = work_dir / f"copart_search_{cd}.csv" if cd  else None
-    copart_output = work_dir / f"copart_price_{cd}.csv"  if cd  else None
-    iaai_input    = work_dir / f"iaai_search_{id_}.csv"  if id_ else None
-    iaai_output   = work_dir / f"iaai_price_{id_}.csv"   if id_ else None
+    today = today or date.today()
+    copart_input, copart_output, iaai_input, iaai_output = _resolve_input_paths(
+        work_dir, today, copart_date, iaai_date,
+    )
 
     jobs: dict[str, BidfaxJob] = {}
 
-    # ---- Phase 1a: Copart Sale-Ended check ------------------------------
-    sale_ended: dict[str, bool] = {}
-    if copart_input and copart_input.exists():
-        _, raw_rows = _read_search_csv(copart_input)
-        active_rows = _filter_active_rows(raw_rows)
-        urls = [str(r.get("Link", "")).strip() for r in active_rows
-                if str(r.get("Link", "")).strip()]
-        print(f"[*] Sale-Ended check on {len(urls)} Copart lot(s)…")
-        sale_ended = run_sale_ended_check(urls, bidfax_client)
-        kept, deleted = collect_copart(jobs, copart_input, copart_output,
-                                       log_path, sale_ended)
-        print(f"[*] Copart: {len(kept)} ended → queued, "
-              f"{len(deleted)} not-ended → removed")
-    else:
-        if copart_date is not None:
-            print(f"[!] Copart input not found for date {copart_date}")
-
-    # ---- Phase 1b: IAAI today's lots ------------------------------------
-    if iaai_input and iaai_input.exists():
-        active = collect_iaai(jobs, iaai_input, iaai_output)
-        print(f"[*] IAAI: {len(active)} lot(s) → queued")
-    else:
-        if iaai_date is not None:
-            print(f"[!] IAAI input not found for date {iaai_date}")
-
-    # ---- Phase 1c: Stale In Progress (CSV + workbook) -------------------
-    files = find_price_files(work_dir, "all")
-    file_data = collect_inprogress_csvs(jobs, files)
-    refresh_count = sum(1 for j in jobs.values()
-                        if any(isinstance(d, _UpdateRowDest) for d in j.destinations))
-    print(f"[*] Refresh: {refresh_count} stale In Progress row(s) → queued")
-
-    wb = collect_inprogress_workbook(jobs, workbook_path)
-    if wb is not None:
-        print(f"[*] Workbook: scanned for In Progress rows")
-
-    if not jobs:
-        print("[+] Nothing to query — exiting.")
-        return
-
-    print(f"\n[*] Bidfax queue: {len(jobs)} unique lot(s)")
-
-    # ---- Phase 2: bidfax lookup ----------------------------------------
-    results = run_bidfax_lookup(
-        jobs, cache_path, delay, max_concurrent, client=bidfax_client,
+    _phase_copart(jobs, copart_input, copart_output, log_path,
+                  bidfax_client, copart_date)
+    _phase_iaai(jobs, iaai_input, iaai_output, iaai_date)
+    file_data, csv_pruned, wb, wb_pruned = _phase_refresh(
+        jobs, work_dir, workbook_path, stale_cutoff_days, today,
     )
 
-    # ---- Phase 3: distribute -------------------------------------------
-    csv_updates, wb_updates = distribute(jobs, results, file_data, wb)
-    if wb is not None and wb_updates and workbook_path is not None:
+    if not jobs and not csv_pruned and not wb_pruned:
+        print("[+] Nothing to query and nothing to prune — exiting.")
+        return
+
+    if jobs:
+        print(f"\n[*] Bidfax queue: {len(jobs)} unique lot(s)")
+
+    results = run_bidfax_lookup(
+        jobs, cache_path, delay, max_concurrent, client=bidfax_client,
+    ) if jobs else {}
+
+    csv_updates, wb_updates, pruned_total = distribute(
+        jobs, results, file_data, wb,
+        csv_pruned=csv_pruned, wb_pruned=wb_pruned,
+    )
+    pruned_wb_total = sum(len(v) for v in wb_pruned.values())
+    if wb is not None and (wb_updates or pruned_wb_total) and workbook_path is not None:
         wb.save(workbook_path)
-        print(f"[+] Workbook updated ({wb_updates} row(s)): {workbook_path.name}")
+        print(f"[+] Workbook saved ({wb_updates} updated, "
+              f"{pruned_wb_total} pruned): {workbook_path.name}")
 
     print(f"\n[+] Done. CSV refresh updates: {csv_updates}, "
-          f"workbook updates: {wb_updates}")
+          f"workbook updates: {wb_updates}, pruned: {pruned_total}")
 
 
 def main() -> None:
@@ -515,18 +735,25 @@ def main() -> None:
                         default=bidfax.DEFAULT_TAB_CONCURRENCY,
                         help=f"Parallel bidfax tabs (default: "
                              f"{bidfax.DEFAULT_TAB_CONCURRENCY})")
+    parser.add_argument("--stale-cutoff-days", type=int,
+                        default=DEFAULT_STALE_DAYS,
+                        help=f"In-Progress rows whose auction date is older "
+                             f"than this many days are deleted from CSVs and "
+                             f"workbook instead of re-queried "
+                             f"(default: {DEFAULT_STALE_DAYS})")
     args = parser.parse_args()
 
     work_dir = Path(args.dir).resolve()
     process(
-        work_dir       = work_dir,
-        cache_path     = Path(args.cache),
-        log_path       = Path(args.log),
-        workbook_path  = Path(args.workbook) if args.workbook else None,
-        delay          = args.delay,
-        max_concurrent = args.concurrent,
-        copart_date    = args.copart_date,
-        iaai_date      = args.iaai_date,
+        work_dir          = work_dir,
+        cache_path        = Path(args.cache),
+        log_path          = Path(args.log),
+        workbook_path     = Path(args.workbook) if args.workbook else None,
+        delay             = args.delay,
+        max_concurrent    = args.concurrent,
+        copart_date       = args.copart_date,
+        iaai_date         = args.iaai_date,
+        stale_cutoff_days = args.stale_cutoff_days,
     )
 
 
