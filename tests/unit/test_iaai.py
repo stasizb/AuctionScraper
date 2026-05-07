@@ -165,10 +165,12 @@ class TestBrowserClientConcurrencyConfig(unittest.TestCase):
     """BrowserIAAIClient should read tab_concurrency from its constructor and
     expose a sensible default for the CLI / orchestrator to pick up."""
 
-    def test_default_constant_is_two(self):
-        # The product decision: parallel by default, but conservatively (2 tabs).
-        # If this changes, double-check IAAI hasn't started rate-limiting.
-        self.assertEqual(DEFAULT_TAB_CONCURRENCY, 2)
+    def test_default_constant_is_positive(self):
+        # The actual value comes from core.concurrency (env-driven); we only
+        # care here that iaai.py re-exports a usable int. Per-value checks
+        # live in test_concurrency.py.
+        self.assertIsInstance(DEFAULT_TAB_CONCURRENCY, int)
+        self.assertGreaterEqual(DEFAULT_TAB_CONCURRENCY, 1)
 
     def test_explicit_value_overrides_default(self):
         # We can't import BrowserIAAIClient unconditionally — it requires the

@@ -99,7 +99,7 @@ def _run_copart(
     delay: float,
     cache_path: Path,
     client: bidfax.BidfaxClient,
-    max_concurrent: int = 1,
+    max_concurrent: int = bidfax.DEFAULT_TAB_CONCURRENCY,
 ) -> tuple[dict[str, tuple], list[dict]]:
     """Returns (results_by_lot, deleted_rows)."""
     cache = bidfax.load_cache(cache_path)
@@ -157,7 +157,7 @@ def process(
     log_path: Path,
     browser_port: int | None = None,
     client: bidfax.BidfaxClient | None = None,
-    max_concurrent: int = 1,
+    max_concurrent: int = bidfax.DEFAULT_TAB_CONCURRENCY,
 ) -> None:
     with input_path.open(newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
@@ -258,8 +258,9 @@ def main() -> None:
                         help="Seconds between searches (default: 2.0)")
     parser.add_argument("--browser-port", type=int, default=None,
                         help="Connect to a running Chrome on this port instead of launching one")
-    parser.add_argument("--concurrent", type=int, default=1,
-                        help="Parallel bidfax tabs (default: 1 = sequential; experimental)")
+    parser.add_argument("--concurrent", type=int, default=bidfax.DEFAULT_TAB_CONCURRENCY,
+                        help=f"Parallel bidfax tabs (default: {bidfax.DEFAULT_TAB_CONCURRENCY}; "
+                             f"override via DEFAULT_TAB_CONCURRENCY env var or .env file)")
     args = parser.parse_args()
 
     file_dir  = Path(args.dir).resolve()

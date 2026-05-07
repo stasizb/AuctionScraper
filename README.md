@@ -134,7 +134,21 @@ python scripts/iaai_search.py --tab-concurrency 1        # disable parallel tabs
 python scripts/iaai_search.py --tab-concurrency 4        # bump parallelism (watch for IAAI throttling)
 ```
 
-`iaai_search.py` scrapes filter rows in parallel browser tabs. The default is **2** tabs (set via `DEFAULT_TAB_CONCURRENCY` in [clients/iaai.py](clients/iaai.py)); raising it speeds up the run but increases the chance IAAI rate-limits the session.
+`iaai_search.py` scrapes filter rows in parallel browser tabs, and the bidfax price scripts (`bidfax_info.py`, `price_refresh.py`, `price_fix.py`) accept `--concurrent` for the same purpose. Both default to **2 tabs**, sourced from `core.concurrency.DEFAULT_TAB_CONCURRENCY`. Resolution order:
+
+1. Process env var `DEFAULT_TAB_CONCURRENCY` (set in shell / CI)
+2. `.env` file at the project root (committed, edit to change the team default)
+3. Hardcoded fallback `2`
+
+```bash
+# One-off shell override
+export DEFAULT_TAB_CONCURRENCY=4 && python run_daily.py
+
+# Persistent change for everyone — edit the .env file:
+#   DEFAULT_TAB_CONCURRENCY=1
+```
+
+Raising parallelism speeds things up but increases the chance IAAI / bidfax rate-limit the session. Per-run CLI flags (`--tab-concurrency`, `--concurrent`) still override everything.
 
 ### Deduplicate
 

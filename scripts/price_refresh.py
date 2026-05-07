@@ -77,7 +77,7 @@ def _fetch_prices(
     delay: float,
     browser_port: int | None = None,
     client: bidfax.BidfaxClient | None = None,
-    max_concurrent: int = 1,
+    max_concurrent: int = bidfax.DEFAULT_TAB_CONCURRENCY,
 ) -> dict[str, tuple]:
     """Return confirmed (price, vin, url) for each lot, using cache where available."""
     cache    = bidfax.load_cache(cache_path)
@@ -243,8 +243,9 @@ def main() -> None:
                         help="Seconds between bidfax searches (default: 2.0)")
     parser.add_argument("--browser-port", type=int, default=None,
                         help="Connect to a running Chrome on this port instead of launching one")
-    parser.add_argument("--concurrent", type=int, default=1,
-                        help="Parallel bidfax tabs (default: 1 = sequential; experimental)")
+    parser.add_argument("--concurrent", type=int, default=bidfax.DEFAULT_TAB_CONCURRENCY,
+                        help=f"Parallel bidfax tabs (default: {bidfax.DEFAULT_TAB_CONCURRENCY}; "
+                             f"override via DEFAULT_TAB_CONCURRENCY env var or .env file)")
     args = parser.parse_args()
 
     work_dir = Path(args.dir).resolve()

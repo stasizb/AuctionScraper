@@ -24,9 +24,10 @@ from typing import Callable, Protocol, runtime_checkable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.chrome  import find_chrome
-from core.dates   import normalize_auction_date
-from core.filters import apply_age_filter
+from core.chrome      import find_chrome
+from core.dates       import normalize_auction_date
+from core.filters     import apply_age_filter
+from core.concurrency import DEFAULT_TAB_CONCURRENCY  # noqa: F401  (re-exported)
 
 try:
     import nodriver as uc
@@ -53,10 +54,10 @@ WAIT_SHORT  = 1.5
 WAIT_MEDIUM = 3.0
 WAIT_LONG   = 5.0
 
-# How many filter rows to scrape concurrently in separate browser tabs.
-# Bumping this speeds up the scrape but increases the chance IAAI throttles
-# the session — keep small. Override per-run via --tab-concurrency.
-DEFAULT_TAB_CONCURRENCY = 2
+# DEFAULT_TAB_CONCURRENCY is re-exported from core.concurrency (set via the
+# DEFAULT_TAB_CONCURRENCY env var or the project-root .env file). It controls
+# how many filter rows scrape in parallel tabs; raising it speeds things up
+# but risks IAAI throttling.
 
 
 # ---------------------------------------------------------------------------
