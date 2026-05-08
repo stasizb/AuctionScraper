@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+      - name: Install dependencies
+        # Only the deps actually exercised by the test suite — the test
+        # double clients (FakeIAAIClient / FakeBidfaxClient / FakeCopartClient)
+        # mean nodriver / requests aren't needed for tests; openpyxl + bs4
+        # are exercised by build_workbook + workbook_to_html / price_fix
+        # integration tests respectively.
+        run: |
+          python -m pip install --upgrade pip
+          pip install openpyxl beautifulsoup4 lxml mypy
+      - name: Run unit + integration tests
+        run: python -m unittest discover tests
+      - name: Type-check (mypy)
+        run: python -m mypy core/ clients/ scripts/ run_daily.py

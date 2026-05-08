@@ -34,8 +34,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from clients import bidfax
-from core.columns  import IN_PROGRESS, LOT_COL, MAKE_COL, PRICE_COL, VIN_COL
-from core.csv_io   import find_price_files, load_csv_dict, save_csv_dict
+from core.columns  import (AUCTION_DATE_COL, IN_PROGRESS, LOT_COL, MAKE_COL,
+                           PRICE_COL, VIN_COL)
+from core.csv_io   import (find_price_files, find_recent_search,
+                           load_csv_dict, save_csv_dict)
 from core.workbook import apply_result_to_row, resolve_columns
 
 try:
@@ -81,7 +83,6 @@ class BidfaxJob:
 # Staleness helpers
 # ---------------------------------------------------------------------------
 
-AUCTION_DATE_COL    = "Auction Date"
 DEFAULT_STALE_DAYS  = 7
 
 # IAAI auction dates land here as "YYYY-MM-DD HH:MM UTC". The trailing
@@ -129,13 +130,12 @@ def _build_output_fieldnames(src_fieldnames: list[str]) -> list[str]:
 
 
 def _read_search_csv(path: Path) -> tuple[list[str], list[dict]]:
-    with path.open(newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        if not reader.fieldnames:
-            sys.exit(f"Input CSV is empty: {path}")
-        if LOT_COL not in reader.fieldnames:
-            sys.exit(f"'{LOT_COL}' not found in {path.name}")
-        return list(reader.fieldnames), list(reader)
+    fieldnames, rows = load_csv_dict(path)
+    if not fieldnames:
+        sys.exit(f"Input CSV is empty: {path}")
+    if LOT_COL not in fieldnames:
+        sys.exit(f"'{LOT_COL}' not found in {path.name}")
+    return fieldnames, rows
 
 
 def _filter_active_rows(rows: list[dict]) -> list[dict]:
@@ -352,10 +352,7 @@ def _remove_from_input(
     deleted_lots:   set[str],
 ) -> None:
     kept = [r for r in rows if str(r.get(LOT_COL, "")).strip() not in deleted_lots]
-    with input_path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=src_fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(kept)
+    save_csv_dict(input_path, src_fieldnames, kept)
     print(f"[*] Removed {len(rows) - len(kept)} lot(s) from {input_path.name}")
 
 
@@ -448,10 +445,7 @@ def _write_new_outputs(
 ) -> None:
     for out_path, (fieldnames, rows) in new_rows_by_path.items():
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
+        save_csv_dict(out_path, fieldnames, rows)
         print(f"[+] Wrote {len(rows)} row(s) → {out_path}")
 
 
@@ -550,24 +544,6 @@ def _apply_workbook(wb, results: dict[str, tuple[str, str, str]]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Date resolution
-# ---------------------------------------------------------------------------
-
-def _find_recent_search(directory: Path, auction: str, date_str: str,
-                        max_days: int = 7) -> str | None:
-    try:
-        d = date.fromisoformat(date_str.replace("_", "-"))
-    except ValueError:
-        return None
-    for offset in range(max_days):
-        candidate = d - timedelta(days=offset)
-        path = directory / f"{auction}_search_{candidate.strftime('%Y_%m_%d')}.csv"
-        if path.exists():
-            return candidate.strftime("%Y_%m_%d")
-    return None
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -579,9 +555,9 @@ def _resolve_input_paths(
 ) -> tuple[Path | None, Path | None, Path | None, Path | None]:
     """Pin Copart + IAAI input/output paths for this run. Each returns
     None when the corresponding search CSV can't be found."""
-    yesterday = (today - timedelta(days=1)).strftime("%Y_%m_%d")
-    cd  = copart_date or _find_recent_search(work_dir, "copart", yesterday)
-    id_ = iaai_date   or _find_recent_search(work_dir, "iaai",   yesterday)
+    yesterday = today - timedelta(days=1)
+    cd  = copart_date or find_recent_search(work_dir, "copart", yesterday)
+    id_ = iaai_date   or find_recent_search(work_dir, "iaai",   yesterday)
     copart_input  = work_dir / f"copart_search_{cd}.csv" if cd  else None
     copart_output = work_dir / f"copart_price_{cd}.csv"  if cd  else None
     iaai_input    = work_dir / f"iaai_search_{id_}.csv"  if id_ else None
@@ -601,6 +577,9 @@ def _phase_copart(
         if copart_date is not None:
             print(f"[!] Copart input not found for date {copart_date}")
         return
+    # _resolve_input_paths always returns input+output as a pair — when
+    # input is set, output is set too. Guard for the type-checker.
+    assert copart_output is not None
     _, raw_rows = _read_search_csv(copart_input)
     active_rows = _filter_active_rows(raw_rows)
     urls = [str(r.get("Link", "")).strip() for r in active_rows
@@ -623,6 +602,7 @@ def _phase_iaai(
         if iaai_date is not None:
             print(f"[!] IAAI input not found for date {iaai_date}")
         return
+    assert iaai_output is not None  # paired with iaai_input — see _resolve_input_paths
     active = collect_iaai(jobs, iaai_input, iaai_output)
     print(f"[*] IAAI: {len(active)} lot(s) → queued")
 

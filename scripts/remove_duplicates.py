@@ -14,44 +14,32 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core.csv_io import find_recent_search, load_csv_dict, save_csv_dict
+
 
 LOT_COLUMN = "Lot Number"
 
 
-def _find_recent_search(directory: Path, auction: str, before: date, max_days: int = 7) -> Path | None:
-    """Return the path of the most recent <auction>_search_<date>.csv on or before `before`."""
-    for offset in range(max_days):
-        candidate = before - timedelta(days=offset)
-        path = directory / f"{auction}_search_{candidate.strftime('%Y_%m_%d')}.csv"
-        if path.exists():
-            return path
-    return None
-
-
 def read_lot_numbers(path: Path) -> set[str]:
-    with open(path, newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        if LOT_COLUMN not in (reader.fieldnames or []):
-            print(f"[!] '{LOT_COLUMN}' column not found in: {path}")
-            sys.exit(1)
-        return {row[LOT_COLUMN].strip() for row in reader if row[LOT_COLUMN].strip()}
+    fieldnames, rows = load_csv_dict(path)
+    if LOT_COLUMN not in fieldnames:
+        print(f"[!] '{LOT_COLUMN}' column not found in: {path}")
+        sys.exit(1)
+    return {row[LOT_COLUMN].strip() for row in rows if row.get(LOT_COLUMN, "").strip()}
 
 
 def read_rows(path: Path) -> tuple[list[str], list[dict]]:
-    with open(path, newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        fieldnames = list(reader.fieldnames or [])
-        if LOT_COLUMN not in fieldnames:
-            print(f"[!] '{LOT_COLUMN}' column not found in: {path}")
-            sys.exit(1)
-        return fieldnames, list(reader)
+    fieldnames, rows = load_csv_dict(path)
+    if LOT_COLUMN not in fieldnames:
+        print(f"[!] '{LOT_COLUMN}' column not found in: {path}")
+        sys.exit(1)
+    return fieldnames, rows
 
 
 def write_rows(path: Path, fieldnames: list[str], rows: list[dict]) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
+    save_csv_dict(path, fieldnames, rows)
 
 
 def remove_duplicate_lots(src_path: Path, dest_path: Path) -> int:
@@ -94,8 +82,10 @@ def main() -> None:
     if args.src:
         src_path = Path(args.src)
     else:
-        src_path = _find_recent_search(dest_path.parent, args.auction, yesterday) or \
-                   Path(f"{args.auction}_search_{yesterday.strftime('%Y_%m_%d')}.csv")
+        ds = find_recent_search(dest_path.parent, args.auction, yesterday)
+        src_path = (dest_path.parent / f"{args.auction}_search_{ds}.csv"
+                    if ds else
+                    Path(f"{args.auction}_search_{yesterday.strftime('%Y_%m_%d')}.csv"))
 
     if not src_path.exists():
         print(f"[!] Source file not found: {src_path}")

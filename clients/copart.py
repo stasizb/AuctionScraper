@@ -131,7 +131,9 @@ class HttpCopartClient:
             try:
                 r = s.get(url, timeout=15)
                 log.info(f"Warmup {url}: HTTP {r.status_code} | cookies: {list(s.cookies.keys())}")
-            except Exception as e:
+            except requests.RequestException as e:
+                # Warmup is best-effort: cookie collection helps avoid CDN
+                # quirks but the search call below works without it too.
                 log.warning(f"Warmup {url} failed: {e}")
         self._session = s
         return s
@@ -151,8 +153,15 @@ class HttpCopartClient:
             except requests.HTTPError as e:
                 log.error(f"  HTTP {e.response.status_code}: {e.response.text[:600]}")
                 break
-            except Exception as e:
+            except requests.RequestException as e:
+                # Connection / timeout / SSL etc. — bail rather than spin
+                # forever on transient network problems.
                 log.error(f"  Request error: {e}")
+                break
+            except ValueError as e:
+                # JSON decode failed — Copart returned non-JSON (HTML
+                # error page, rate-limit response, etc.).
+                log.error(f"  Bad JSON response: {e}")
                 break
 
             results_data   = (data.get("data") or {}).get("results") or {}

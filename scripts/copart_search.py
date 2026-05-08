@@ -162,7 +162,10 @@ def lot_to_row(lot: dict, filters: dict) -> dict:
         try:
             dt = datetime.fromtimestamp(int(sale_ts) / 1000, tz=timezone.utc)
             auction_date_str = dt.strftime("%Y-%m-%d %H:%M UTC")
-        except Exception:
+        except (ValueError, TypeError, OSError, OverflowError):
+            # Copart sometimes returns nonsensical timestamps (string,
+            # negative, far-future). Keep the raw value so a human can
+            # inspect rather than silently dropping the row.
             auction_date_str = str(sale_ts)
 
     return {
@@ -251,15 +254,13 @@ def main():
             log.error(f"  Error: {e}")
         time.sleep(REQUEST_DELAY)
 
+    from core.csv_io import save_csv_dict
     output_path = Path(args.output)
     fieldnames  = [
         "Make", "Model", "Year", "Odometer", "Fuel Type",
         "Lot Number", "Link", "Auction Date", "Location", "Primary Damage",
     ]
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(all_rows)
+    save_csv_dict(output_path, fieldnames, all_rows)
 
     if all_rows:
         log.info(f"✓ Saved {len(all_rows)} result(s) to {output_path}")

@@ -134,9 +134,12 @@ class TestEndToEnd(unittest.TestCase):
             deleted_lots = {r["Lot Number"] for r in entries[0]["deleted_items"]}
             self.assertEqual(deleted_lots, {"222"})
 
-            # Cache was populated with the resolved prices.
+            # Cache was populated with the resolved prices. The "_ts" key
+            # holds per-entry timestamps for TTL — strip it for the
+            # content-only assertion.
             cache_data = json.loads(cache.read_text(encoding="utf-8"))
-            self.assertEqual(set(cache_data.keys()), {"111", "333", "444"})
+            cache_keys = set(cache_data.keys()) - {"_ts"}
+            self.assertEqual(cache_keys, {"111", "333", "444"})
 
             # The fake was queried — exactly once per unique lot.
             self.assertEqual(set(fake.lookup_calls), {"111", "333", "444"})

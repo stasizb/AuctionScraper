@@ -28,12 +28,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.columns import PRICE_COL, VIN_COL
+from core.columns import AUCTION_DATE_COL, LINK_COL, MAKE_COL, PRICE_COL, VIN_COL
 from core.dates   import normalize_auction_date
-
-AUCTION_DATE_COL = "Auction Date"
-LINK_COL         = "Link"
-MAKE_COL         = "Make"
 
 try:
     import openpyxl
@@ -174,25 +170,21 @@ def process_csv(csv_path: Path, wb: openpyxl.Workbook) -> int:
     added = 0
     sheet_hdrs: dict[str, list[str]] = {}
 
-    with open(csv_path, newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        if not reader.fieldnames:
-            print(f"    [warn] No headers found — skipping {csv_path.name}")
-            return 0
-
-        fieldnames = list(reader.fieldnames)
-        headers    = _build_headers(fieldnames)
-
-        for row in reader:
-            price, vin = _extract_price_vin(row, fieldnames)
-            make  = (row.get(MAKE_COL) or "UNKNOWN").strip().upper()
-            ws    = _get_or_create_sheet(wb, make, headers)
-            title = ws.title
-            if title not in sheet_hdrs:
-                sheet_hdrs[title] = _sheet_headers(ws)
-            ws.append([_cell_value(col, row, price, vin) for col in sheet_hdrs[title]])
-            added += 1
-
+    from core.csv_io import load_csv_dict
+    fieldnames, rows = load_csv_dict(csv_path)
+    if not fieldnames:
+        print(f"    [warn] No headers found — skipping {csv_path.name}")
+        return 0
+    headers = _build_headers(fieldnames)
+    for row in rows:
+        price, vin = _extract_price_vin(row, fieldnames)
+        make  = (row.get(MAKE_COL) or "UNKNOWN").strip().upper()
+        ws    = _get_or_create_sheet(wb, make, headers)
+        title = ws.title
+        if title not in sheet_hdrs:
+            sheet_hdrs[title] = _sheet_headers(ws)
+        ws.append([_cell_value(col, row, price, vin) for col in sheet_hdrs[title]])
+        added += 1
     return added
 
 

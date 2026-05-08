@@ -15,6 +15,7 @@ from unittest.mock import patch
 from tests._helpers import ROOT  # noqa: F401
 
 import core.concurrency as concurrency_mod
+import core.env         as env_mod
 
 
 def _reload(env: dict[str, str] | None = None) -> int:
@@ -32,7 +33,7 @@ class _DotenvSandbox:
 
     def __init__(self, contents: str | None):
         self._contents = contents
-        self._target   = Path(concurrency_mod._ENV_FILE)
+        self._target   = Path(env_mod.ENV_FILE)
         self._backup   = self._target.with_suffix(".env.bak-test")
 
     def __enter__(self):
@@ -61,7 +62,7 @@ class TestDefaultTabConcurrency(unittest.TestCase):
         # .env file. Read it ourselves so this test stays correct as the
         # team default changes over time.
         os.environ.pop("DEFAULT_TAB_CONCURRENCY", None)
-        expected = int(concurrency_mod._load_dotenv()["DEFAULT_TAB_CONCURRENCY"])
+        expected = int(env_mod.load_dotenv()["DEFAULT_TAB_CONCURRENCY"])
         importlib.reload(concurrency_mod)
         self.assertEqual(concurrency_mod.DEFAULT_TAB_CONCURRENCY, expected)
 

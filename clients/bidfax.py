@@ -19,7 +19,6 @@ pure HTML-parsing function (extract_grid_result), and the high-level
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import sys
 import time
@@ -53,66 +52,29 @@ _COPART_RENDER_WAIT = 4.0
 _MAX_CONCURRENT     = 5
 
 _BIDFAX_HOME_PATH = re.compile(r'^https?://bidfax\.info/?$')
-_RESULT_URL_RE    = re.compile(r'^https://bidfax\.info/[^/]+/[^/]+/.+\.html$')
-_VIN_FROM_URL_RE  = re.compile(r'-vin-([a-z0-9]+)\.html$', re.IGNORECASE)
+# RESULT_URL_RE / VIN_FROM_URL_RE live in bidfax_parsing — re-exported below
+# under their old leading-underscore names for any callers / tests that
+# reach in for them.
 
 
 # ---------------------------------------------------------------------------
-# Cache helpers (pure)
+# Cache helpers — re-exported from clients.bidfax_cache so the cache module
+# stays browser-free (no nodriver dep) and can be unit-tested in isolation.
 # ---------------------------------------------------------------------------
 
-def load_cache(path: Path) -> dict:
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return {k: tuple(v) if isinstance(v, list) else v for k, v in data.items()}
-        except ValueError:
-            return {}
-    return {}
-
-
-def save_cache(path: Path, cache: dict) -> None:
-    serialisable = {k: list(v) if isinstance(v, tuple) else v for k, v in cache.items()}
-    path.write_text(json.dumps(serialisable, indent=2, sort_keys=True), encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# URL / HTML parsing (pure)
-# ---------------------------------------------------------------------------
-
-def url_make_matches(csv_make: str, bidfax_url: str) -> bool:
-    parts    = bidfax_url.replace("https://bidfax.info/", "").split("/")
-    url_make = parts[0].lower() if parts else ""
-    norm     = re.sub(r"[\s_]+", "-", csv_make.strip().lower())
-    return bool(url_make) and (url_make == norm
-                                or norm.startswith(url_make)
-                                or url_make.startswith(norm))
-
-
-def extract_grid_result(html: str) -> tuple[str, str, str] | None:
-    """Parse bidfax results-page HTML. Returns (price, vin, url) or None."""
-    if not _DEPS_OK:
-        return None
-    soup = BeautifulSoup(html, "lxml")
-    grid = soup.find(id="grid")
-    if not grid:
-        return None
-    url = next(
-        (a["href"] for a in grid.find_all("a", href=True)
-         if _RESULT_URL_RE.match(a["href"])),
-        None,
-    )
-    if not url:
-        return None
-    m_vin = _VIN_FROM_URL_RE.search(url)
-    vin   = m_vin.group(1).upper() if m_vin else ""
-    price = IN_PROGRESS
-    span  = grid.find("span", class_="prices")
-    if span:
-        raw = span.get_text(strip=True)
-        if raw.isdigit():
-            price = f"${int(raw):,}"
-    return price, vin, url
+from clients.bidfax_cache   import (   # noqa: E402
+    DEFAULT_CACHE_TTL_DAYS,
+    _TIMESTAMPS_KEY,
+    cache_results,
+    load_cache,
+    save_cache,
+)
+from clients.bidfax_parsing import (   # noqa: E402
+    extract_grid_result,
+    url_make_matches,
+    RESULT_URL_RE   as _RESULT_URL_RE,
+    VIN_FROM_URL_RE as _VIN_FROM_URL_RE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -353,8 +315,8 @@ def run_batch(
         print("[warn] nodriver/bs4 not installed — skipping bidfax lookups.")
         return {q: (IN_PROGRESS, "", "") for q in queries}
 
-    cache    = load_cache(cache_path)
-    to_fetch = [q for q in queries if q not in cache]
+    cache    = load_cache(cache_path, ttl_days=DEFAULT_CACHE_TTL_DAYS)
+    to_fetch = [q for q in queries if q not in cache or q == _TIMESTAMPS_KEY]
 
     if to_fetch:
         print(f"[*] bidfax lookup: {len(to_fetch)} new  (cached: {len(cache)})")
@@ -362,10 +324,10 @@ def run_batch(
         fetched     = real_client.lookup_many(
             to_fetch, makes=makes, delay=delay, max_concurrent=max_concurrent,
         )
-        cache.update({q: v for q, v in fetched.items() if v[0] != IN_PROGRESS})
-        save_cache(cache_path, cache)
+        cache = cache_results(cache_path, fetched)
 
-    return {q: cache.get(q, (IN_PROGRESS, "", "")) for q in queries}
+    return {q: cache.get(q, (IN_PROGRESS, "", "")) for q in queries
+            if q != _TIMESTAMPS_KEY}
 
 
 def run_batch_vins(

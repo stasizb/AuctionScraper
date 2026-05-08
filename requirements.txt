@@ -1,0 +1,9 @@
+# Core scraping stack — all four are required for run_daily.py.
+# Versions are intentionally unpinned: the project uses small, stable
+# subsets of each library. Pin if a future upgrade breaks something.
+
+nodriver           # CDP-based browser automation (IAAI, bidfax)
+requests           # HTTP client (Copart's public lots API)
+beautifulsoup4     # HTML parsing for bidfax results + price_fix HTML rewrite
+lxml               # bs4's fastest parser backend
+openpyxl           # Excel workbook read/write (auction_results.xlsx)

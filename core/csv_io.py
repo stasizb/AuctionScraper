@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import re
+from datetime import date, timedelta
 from pathlib import Path
 
 
@@ -42,3 +43,34 @@ def find_price_files(directory: Path, auction: str = "all") -> list[Path]:
         if m and (auction == "all" or m.group(1).lower() == auction.lower()):
             files.append(path)
     return files
+
+
+def find_recent_search(
+    directory:  Path,
+    auction:    str,
+    on_or_before: date | str,
+    *,
+    max_days:   int = 7,
+) -> str | None:
+    """Return the most recent `<auction>_search_<YYYY_MM_DD>.csv` date string
+    on or before `on_or_before`, walking back up to `max_days` days.
+
+    `on_or_before` can be a `datetime.date` or a "YYYY_MM_DD" / "YYYY-MM-DD"
+    string. The returned value is always the "YYYY_MM_DD" string used in
+    file names, or None if no matching file exists in that window.
+
+    Consolidates the four near-identical implementations that previously
+    lived in run_daily.py, bidfax_info.py, bidfax_run.py, and
+    remove_duplicates.py.
+    """
+    if isinstance(on_or_before, str):
+        try:
+            on_or_before = date.fromisoformat(on_or_before.replace("_", "-"))
+        except ValueError:
+            return None
+    for offset in range(max_days):
+        candidate = on_or_before - timedelta(days=offset)
+        path = directory / f"{auction}_search_{candidate.strftime('%Y_%m_%d')}.csv"
+        if path.exists():
+            return candidate.strftime("%Y_%m_%d")
+    return None

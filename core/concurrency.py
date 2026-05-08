@@ -12,8 +12,7 @@ Malformed values, zero, or negatives all silently fall back to the default
 so a misconfigured .env can never deadlock the asyncio.Semaphore.
 """
 
-from core.env import read_int, load_dotenv as _load_dotenv  # noqa: F401  (back-compat)
-from core.env import ENV_FILE     as _ENV_FILE              # noqa: F401  (back-compat)
+from core.env import read_int
 
 ENV_VAR  = "DEFAULT_TAB_CONCURRENCY"
 _DEFAULT = 2

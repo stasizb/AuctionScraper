@@ -33,7 +33,8 @@ except ImportError:
     sys.exit("openpyxl not found.  Install with:  pip install openpyxl")
 
 from clients import bidfax
-from core.dates import normalize_auction_date as _normalize_auction_date
+from core.columns import AUCTION_DATE_COL as _AUCTION_DATE_COL
+from core.dates   import normalize_auction_date as _normalize_auction_date
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -42,7 +43,6 @@ from core.dates import normalize_auction_date as _normalize_auction_date
 _HYPERLINK_RE    = re.compile(r'=HYPERLINK\("([^"]+)"', re.IGNORECASE)
 _PRICE_RE        = re.compile(r'^\$([\d,]+)$')
 _NUMERIC_COLS    = {"Year", "Odometer", "Price"}
-_AUCTION_DATE_COL = "Auction Date"
 
 _TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
@@ -115,16 +115,17 @@ def _lookup_bidfax_urls(
 
 def _load_today_lots(search_dir: Path, today_str: str) -> dict[str, list[dict]]:
     """Load copart + iaai search CSVs for today. Returns {MAKE_UPPER: [row_dicts]}."""
+    from core.csv_io import load_csv_dict
     result: dict[str, list[dict]] = {}
     for auction in ("copart", "iaai"):
         path = search_dir / f"{auction}_search_{today_str}.csv"
         if not path.exists():
             continue
-        with path.open(newline="", encoding="utf-8-sig") as fh:
-            for row in csv.DictReader(fh):
-                make = str(row.get("Make", "") or "").strip().upper()
-                if make:
-                    result.setdefault(make, []).append(dict(row))
+        _, rows = load_csv_dict(path)
+        for row in rows:
+            make = str(row.get("Make", "") or "").strip().upper()
+            if make:
+                result.setdefault(make, []).append(dict(row))
     return result
 
 

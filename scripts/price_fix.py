@@ -120,10 +120,7 @@ def lookup_lots(
             print(f"  [bidfax] {lot} — not found, SKIPPED")
 
     if cache_path is not None and results:
-        cache = bidfax.load_cache(cache_path)
-        cache.update({lot: v for lot, v in results.items()
-                      if v[0] != bidfax.IN_PROGRESS})
-        bidfax.save_cache(cache_path, cache)
+        bidfax.cache_results(cache_path, results)
         print(f"[+] Cached {len(results)} bidfax result(s) → {cache_path.name}")
 
     return results

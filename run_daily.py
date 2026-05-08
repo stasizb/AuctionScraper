@@ -49,7 +49,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from core.chrome import find_chrome
+from core.chrome         import find_chrome
+from core.csv_io         import find_recent_search
+from core.logging_setup  import setup_logging
 
 # Child Python processes write to pipes in `run_parallel`. Block-buffered
 # stdout means the user sees nothing until the subprocess exits — which
@@ -101,20 +103,15 @@ def _start_shared_chrome(profile_dir: Path) -> tuple[subprocess.Popen, int]:
     return proc, port
 
 
-def _find_recent_search(output_dir: Path, auction: str, before: date, max_days: int = 7) -> str | None:
-    """Return the date string (YYYY_MM_DD) of the most recent <auction>_search_<date>.csv
-    that exists in output_dir, starting from `before` and going back up to max_days.
-    Returns None if no file is found.
-    """
-    for offset in range(max_days):
-        candidate = before - timedelta(days=offset)
-        path = output_dir / f"{auction}_search_{candidate.strftime('%Y_%m_%d')}.csv"
-        if path.exists():
-            if offset > 0:
-                print(f"  [*] {auction} search file for {before} not found — "
-                      f"using {candidate} (-{offset}d)")
-            return candidate.strftime("%Y_%m_%d")
-    return None
+def _resolve_recent_search(output_dir: Path, auction: str, before: date) -> str | None:
+    """Wrap `core.csv_io.find_recent_search` with the daily-run-specific
+    progress message: when the resolved date isn't `before` itself, log
+    which fallback date we picked. Lets the operator notice missing days."""
+    found = find_recent_search(output_dir, auction, before)
+    if found and found != before.strftime("%Y_%m_%d"):
+        print(f"  [*] {auction} search file for {before} not found — "
+              f"using {found}")
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +215,9 @@ def run_parallel_chains(chains: list[list[tuple[str, list[str]]]]) -> None:
             bufsize=1,                 # line-buffered
         )
         try:
+            # subprocess.PIPE was passed, so stdout is always non-None here;
+            # the assert is for the type-checker, not real coverage.
+            assert proc.stdout is not None
             for line in proc.stdout:
                 with _lock:
                     print(prefix + line, end="", flush=True)
@@ -384,6 +384,11 @@ def main() -> None:
     logs    = root / "logs"
     output  = root / "output"
 
+    # Persist a full transcript of this run to `logs/run_<date>.log` so the
+    # operator can grep it later without re-running. print()/job_log keep
+    # writing to stdout exactly as before — this is purely additive.
+    setup_logging(log_file=logs / f"run_{today}.log")
+
     def s(name: str) -> str:
         """Full path to a script inside the scripts/ directory."""
         return str(root / "scripts" / name)
@@ -402,8 +407,8 @@ def main() -> None:
     try:
         # Resolve yesterday's search dates up front so phase 1 can chain
         # step 3 (which depends on them) onto the copart-search step.
-        copart_date = _find_recent_search(output, "copart", _yesterday)
-        iaai_date   = _find_recent_search(output, "iaai",   _yesterday)
+        copart_date = _resolve_recent_search(output, "copart", _yesterday)
+        iaai_date   = _resolve_recent_search(output, "iaai",   _yesterday)
 
         # Bidfax queue size = yesterday's Copart input + yesterday's IAAI input
         # + In Progress rows from older price CSVs. Sampled now (pre-run) so

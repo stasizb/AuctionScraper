@@ -96,6 +96,78 @@ class TestCache(unittest.TestCase):
             self.assertEqual(raw["k"], ["a", "b", "c"])
 
 
+class TestCacheTTL(unittest.TestCase):
+    """Cached entries get a per-key timestamp; load_cache(ttl_days=N)
+    drops anything older than that. Legacy entries (no _ts map yet) are
+    treated as fresh so rolling TTL out doesn't nuke months of cache."""
+
+    def test_cache_results_records_timestamp(self):
+        from datetime import date as _date
+        from clients.bidfax import cache_results, _TIMESTAMPS_KEY
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            cache_results(
+                path,
+                {"42": ("$100", "VIN", "https://bidfax.info/x/y/z.html")},
+                today=_date(2026, 5, 7),
+            )
+            loaded = load_cache(path)
+            self.assertEqual(loaded["42"], ("$100", "VIN",
+                                            "https://bidfax.info/x/y/z.html"))
+            self.assertEqual(loaded[_TIMESTAMPS_KEY]["42"], "2026-05-07")
+
+    def test_in_progress_results_are_not_cached(self):
+        from datetime import date as _date
+        from clients.bidfax import IN_PROGRESS, cache_results, _TIMESTAMPS_KEY
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            cache_results(path, {"42": (IN_PROGRESS, "", "")},
+                          today=_date(2026, 5, 7))
+            loaded = load_cache(path)
+            self.assertNotIn("42", loaded)
+            self.assertEqual(loaded.get(_TIMESTAMPS_KEY, {}), {})
+
+    def test_load_cache_expires_old_entries(self):
+        from datetime import date as _date
+        from clients.bidfax import _TIMESTAMPS_KEY
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            save_cache(path, {
+                "old":     ("$10", "VIN1", "u1"),
+                "recent":  ("$20", "VIN2", "u2"),
+                _TIMESTAMPS_KEY: {
+                    "old":    "2026-01-01",   # 126d before today
+                    "recent": "2026-05-01",   # 6d before today
+                },
+            })
+            loaded = load_cache(path, ttl_days=30, today=_date(2026, 5, 7))
+            self.assertNotIn("old", loaded)
+            self.assertIn("recent", loaded)
+            # Timestamp map drops the same keys it expires.
+            self.assertNotIn("old", loaded[_TIMESTAMPS_KEY])
+
+    def test_legacy_cache_without_timestamps_treated_as_fresh(self):
+        from datetime import date as _date
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            save_cache(path, {"legacy": ("$10", "VIN", "u")})
+            loaded = load_cache(path, ttl_days=1, today=_date(2026, 5, 7))
+            # Without a _ts map nothing can be expired — keep the entry.
+            self.assertIn("legacy", loaded)
+
+    def test_ttl_zero_disables_expiration(self):
+        from datetime import date as _date
+        from clients.bidfax import _TIMESTAMPS_KEY
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            save_cache(path, {
+                "old":           ("$10", "VIN", "u"),
+                _TIMESTAMPS_KEY: {"old": "2020-01-01"},
+            })
+            loaded = load_cache(path, ttl_days=0, today=_date(2026, 5, 7))
+            self.assertIn("old", loaded)
+
+
 class TestFakeBidfaxClient(unittest.TestCase):
     def test_known_lookup(self):
         c = FakeBidfaxClient(responses={"A": ("$1", "V", "u")})

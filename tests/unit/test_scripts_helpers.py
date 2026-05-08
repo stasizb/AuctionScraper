@@ -7,37 +7,45 @@ from pathlib import Path
 
 from tests._helpers import ROOT  # noqa: F401
 
-import bidfax_info
+import bidfax_run
 import build_workbook
 import price_fix
-import price_refresh
 import workbook_to_html
 
 
 class TestBuildOutputFieldnames(unittest.TestCase):
+    """Same logic that used to live in bidfax_info._build_output_fieldnames
+    now lives in bidfax_run._build_output_fieldnames — Price column gets
+    inserted right after Odometer, VIN column appended at the end."""
+
     def test_price_inserted_after_odometer_vin_appended(self):
         src = ["Make", "Model", "Year", "Odometer", "Fuel Type", "Lot Number", "Link"]
-        out = bidfax_info._build_output_fieldnames(src)
+        out = bidfax_run._build_output_fieldnames(src)
         self.assertEqual(out.index("Price"), out.index("Odometer") + 1)
         self.assertEqual(out[-1], "VIN")
 
     def test_no_odometer_price_at_end(self):
-        out = bidfax_info._build_output_fieldnames(["Make", "Lot Number"])
+        out = bidfax_run._build_output_fieldnames(["Make", "Lot Number"])
         self.assertIn("Price", out)
         self.assertEqual(out[-1], "VIN")
 
 
-class TestBuildOutputRow(unittest.TestCase):
+class TestBuildNewRow(unittest.TestCase):
+    """`bidfax_run._build_new_row` is the consolidated equivalent of the
+    old bidfax_info._build_output_row — overlays Price / VIN / bidfax URL
+    onto the source-search row."""
+
     def test_sets_price_vin_and_link(self):
         row = {"Make": "HONDA", "Link": "original"}
-        out = bidfax_info._build_output_row(row, "$100", "VIN1", "https://bidfax.info/new")
+        out = bidfax_run._build_new_row(row, "$100", "VIN1",
+                                        "https://bidfax.info/new")
         self.assertEqual(out["Price"], "$100")
-        self.assertEqual(out["VIN"], "VIN1")
-        self.assertEqual(out["Link"], "https://bidfax.info/new")
+        self.assertEqual(out["VIN"],   "VIN1")
+        self.assertEqual(out["Link"],  "https://bidfax.info/new")
 
     def test_empty_url_keeps_original_link(self):
         row = {"Make": "HONDA", "Link": "original"}
-        out = bidfax_info._build_output_row(row, "$100", "VIN1", "")
+        out = bidfax_run._build_new_row(row, "$100", "VIN1", "")
         self.assertEqual(out["Link"], "original")
 
 
@@ -83,12 +91,17 @@ class TestFindPendingFiles(unittest.TestCase):
             self.assertNotIn("copart_search_2026_01_01.csv", names)
 
 
-class TestPriceRefreshPattern(unittest.TestCase):
+class TestPriceFilePattern(unittest.TestCase):
+    """Pattern used by find_price_files to decide whether a CSV is a
+    price file. Lives in core/csv_io.py now — the price_refresh script
+    that used to re-export it has been deleted."""
+
     def test_matches_price_not_search(self):
-        self.assertTrue(price_refresh.FILE_PATTERN.match("copart_price_2026_01_01.csv"))
-        self.assertTrue(price_refresh.FILE_PATTERN.match("iaai_price_2026_01_01.csv"))
-        self.assertIsNone(price_refresh.FILE_PATTERN.match("copart_search_2026_01_01.csv"))
-        self.assertIsNone(price_refresh.FILE_PATTERN.match("readme.txt"))
+        from core.csv_io import PRICE_FILE_PATTERN
+        self.assertTrue(PRICE_FILE_PATTERN.match("copart_price_2026_01_01.csv"))
+        self.assertTrue(PRICE_FILE_PATTERN.match("iaai_price_2026_01_01.csv"))
+        self.assertIsNone(PRICE_FILE_PATTERN.match("copart_search_2026_01_01.csv"))
+        self.assertIsNone(PRICE_FILE_PATTERN.match("readme.txt"))
 
 
 class TestPriceFixParseLots(unittest.TestCase):

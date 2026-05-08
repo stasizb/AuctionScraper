@@ -27,7 +27,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.chrome      import find_chrome
 from core.dates       import normalize_auction_date
 from core.debug       import DEBUG_SCREENSHOTS
-from core.filters     import apply_age_filter
 from core.concurrency import DEFAULT_TAB_CONCURRENCY  # noqa: F401  (re-exported)
 from core.job_log     import job_log
 
@@ -44,7 +43,9 @@ except ImportError:
 
 IAAI_SEARCH_URL = "https://www.iaai.com/Search"
 
-AUCTION_DATE_COL = "Auction Date"
+# AUCTION_DATE_COL is sourced from core.columns (re-exported below for
+# back-compat with code that still does `from clients.iaai import AUCTION_DATE_COL`).
+from core.columns import AUCTION_DATE_COL  # noqa: E402,F401
 
 OUTPUT_FIELDS = [
     "Make", "Model", "Year", "Odometer", "Fuel Type",
@@ -72,84 +73,22 @@ _BAKED_ODO_MAX = 30000
 # Pure helpers (no browser)
 # ---------------------------------------------------------------------------
 
-def equipment_matches(full_title: str, equipment: str) -> bool:
-    """Return True when every word in `equipment` appears as a token in `full_title`."""
-    if not equipment:
-        return True
-    title_tokens   = set(re.findall(r'\S+', full_title.upper()))
-    required_words = [w.upper() for w in equipment.split() if w.strip()]
-    return all(word in title_tokens for word in required_words)
-
-
-def _reassemble_segments(raw_line: str) -> list[str]:
-    segments: list[str] = []
-    buffer = ""
-    for part in raw_line.split(","):
-        if ":" in part:
-            if buffer:
-                segments.append(buffer.strip())
-            buffer = part
-        else:
-            buffer = (buffer + ", " + part) if buffer else part
-    if buffer:
-        segments.append(buffer.strip())
-    return segments
-
-
-def _apply_segment(filters: dict, key: str, val: str) -> None:
-    if key == "make":
-        filters["make"] = val.upper()
-    elif key == "model":
-        models = [v.strip().upper() for v in val.split(";") if v.strip()]
-        filters["models"] = models if models else [val.upper()]
-    elif key in ("year_min", "yearmin"):
-        try: filters["year_min"] = int(val)
-        except ValueError: pass
-    elif key in ("year_max", "yearmax"):
-        try: filters["year_max"] = int(val)
-        except ValueError: pass
-    elif key == "age":
-        try: filters["age"] = int(val)
-        except ValueError: pass
-    elif key in ("odometer_max", "odo_max", "odometer"):
-        try: filters["odometer_max"] = int(val)
-        except ValueError: pass
-    elif key in ("fuel_type", "fueltype", "fuel"):
-        filters["fuel_type"] = val.strip()
-    elif key == "equipment":
-        filters["equipment"] = val.strip()
-
-
-def parse_filter_row(raw_line: str) -> dict:
-    """Parse one line of 'Key: Value' comma-separated segments."""
-    filters: dict = {}
-    for seg in _reassemble_segments(raw_line):
-        m = re.match(r"^([^:]+?)\s*:\s*(.+)$", seg.strip())
-        if not m:
-            continue
-        key = m.group(1).strip().lower().replace(" ", "_")
-        _apply_segment(filters, key, m.group(2).strip())
-    return apply_age_filter(filters)
-
-
-def read_filters_csv(path: str) -> list[dict]:
-    filter_list: list[dict] = []
-    with open(path, newline="", encoding="utf-8-sig") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parsed = parse_filter_row(line)
-            if parsed:
-                filter_list.append(parsed)
-    return filter_list
+# Filter parsing + equipment post-filter live in clients.iaai_filters so this
+# module isn't 800+ lines of mixed concerns. Re-exported here so existing
+# `from clients.iaai import parse_filter_row` etc. keep working.
+from clients.iaai_filters import (   # noqa: E402
+    _apply_segment,
+    _reassemble_segments,
+    apply_equipment_postfilter,
+    equipment_matches,
+    parse_filter_row,
+    read_filters_csv,
+)
 
 
 def write_output_csv(path: str, records: list[dict]) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(records)
+    from core.csv_io import save_csv_dict
+    save_csv_dict(Path(path), OUTPUT_FIELDS, records)
     print(f"[+] Saved {len(records)} record(s) -> {path}")
 
 
@@ -178,18 +117,6 @@ def _parse_scraped_row(r: dict) -> dict | None:
         record[AUCTION_DATE_COL] = normalize_auction_date(record[AUCTION_DATE_COL])
     record["_full_title"] = r.get("_full_title", "")
     return record if record.get("Link") else None
-
-
-def apply_equipment_postfilter(page_records: list, equipment: str) -> list:
-    if not equipment:
-        print(f"        -> {len(page_records)} raw vehicle(s) found on page", flush=True)
-        return page_records
-    kept = [r for r in page_records
-            if equipment_matches(r.get("_full_title", ""), equipment)]
-    dropped = len(page_records) - len(kept)
-    print(f"        -> {len(page_records)} raw / {dropped} dropped by "
-          f"equipment filter / {len(kept)} kept", flush=True)
-    return kept
 
 
 # ---------------------------------------------------------------------------
