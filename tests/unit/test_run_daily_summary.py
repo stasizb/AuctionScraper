@@ -151,5 +151,32 @@ class TestTimingSection(unittest.TestCase):
         self.assertIn("—", out)
 
 
+class TestFromStepMapping(unittest.TestCase):
+    """`--from-step` lets the operator skip phases that already succeeded.
+    Guard the choice→phase map so a typo or a renamed phase fails loudly."""
+
+    def test_phase_map_covers_all_choices(self):
+        # Each CLI choice resolves to a phase ordinal; ordinals are 1..4
+        # in execution order, so a re-run from a later phase trivially
+        # short-circuits earlier ones.
+        self.assertEqual(run_daily._FROM_STEP_PHASES["search"],   run_daily.PHASE_SEARCH)
+        self.assertEqual(run_daily._FROM_STEP_PHASES["bidfax"],   run_daily.PHASE_BIDFAX)
+        self.assertEqual(run_daily._FROM_STEP_PHASES["workbook"], run_daily.PHASE_WORKBOOK)
+        self.assertEqual(run_daily._FROM_STEP_PHASES["html"],     run_daily.PHASE_HTML)
+
+    def test_phase_ordinals_are_strictly_increasing(self):
+        ordinals = [run_daily.PHASE_SEARCH, run_daily.PHASE_BIDFAX,
+                    run_daily.PHASE_WORKBOOK, run_daily.PHASE_HTML]
+        self.assertEqual(ordinals, sorted(ordinals))
+        self.assertEqual(len(set(ordinals)), len(ordinals))
+
+    def test_search_phase_is_first(self):
+        # Default `--from-step search` must run everything — that means
+        # PHASE_SEARCH is the smallest ordinal so `from_phase <= PHASE_X`
+        # is True for every X.
+        self.assertEqual(min(run_daily._FROM_STEP_PHASES.values()),
+                         run_daily.PHASE_SEARCH)
+
+
 if __name__ == "__main__":
     unittest.main()

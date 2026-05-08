@@ -34,6 +34,13 @@ Stops immediately if any step fails.
 USAGE:
     python run_daily.py
     python run_daily.py --root /path/to/project
+
+    # Re-run from a specific phase when an earlier one already succeeded
+    # today — saves the long IAAI scrape when only bidfax / workbook /
+    # html need a redo.
+    python run_daily.py --from-step bidfax     # skip phase 1 (searches)
+    python run_daily.py --from-step workbook   # skip phases 1-2
+    python run_daily.py --from-step html       # only re-render the HTML
 """
 
 import argparse
@@ -138,6 +145,26 @@ STEP_REMOVE_DUPLICATES  = "3. Remove Copart duplicates (yesterday vs today)"
 STEP_BIDFAX_RUN         = "4. Bidfax pipeline (sale-ended + lookup + refresh)"
 STEP_BUILD_WORKBOOK     = "5. Build Excel workbook"
 STEP_HTML_REPORT        = "6. Generate HTML report"
+
+
+# ---------------------------------------------------------------------------
+# --from-step support
+# ---------------------------------------------------------------------------
+# Maps the user-facing CLI choice to a numeric phase ordinal. Phases are
+# what `process()` skips/runs, not individual steps — the bidfax phase is
+# one step but the search phase is three. Numbered so a re-run from a
+# later phase trivially short-circuits with `if from_phase <= N`.
+PHASE_SEARCH    = 1   # Copart + Remove-duplicates + IAAI (parallel)
+PHASE_BIDFAX    = 2   # bidfax_run.py (sale-ended + lookup + refresh)
+PHASE_WORKBOOK  = 3   # build_workbook.py
+PHASE_HTML      = 4   # workbook_to_html.py
+
+_FROM_STEP_PHASES: dict[str, int] = {
+    "search":   PHASE_SEARCH,
+    "bidfax":   PHASE_BIDFAX,
+    "workbook": PHASE_WORKBOOK,
+    "html":     PHASE_HTML,
+}
 
 
 def _record(name: str, status: str, detail: str = "") -> None:
@@ -362,6 +389,78 @@ def _print_timing_section() -> None:
               f"{_format_duration(secs)}  ·  {cars} cars  ·  {per_car}")
 
 
+def _phase_search(py, s, o, bp,
+                  output:         Path,
+                  filters:        Path,
+                  chrome_profile: Path,
+                  today:          str,
+                  copart_date:    str | None) -> None:
+    """Phase 1: parallel chains.
+      Chain A: copart_search → remove_duplicates  (HTTP, then file I/O)
+      Chain B: iaai_search                        (browser-bound, long pole)
+    Step 3 only depends on chain A's output, so it chains directly behind
+    copart_search rather than waiting for the slower IAAI scrape."""
+    chain_copart: list[tuple[str, list[str]]] = [
+        (STEP_COPART_SEARCH, [
+            py, s("copart_search.py"),
+            "--input",  str(filters / "copart_filters.csv"),
+            "--output", o(f"copart_search_{today}.csv"),
+        ]),
+    ]
+    if copart_date:
+        chain_copart.append((STEP_REMOVE_DUPLICATES, [
+            py, s("remove_duplicates.py"),
+            "--auction", "copart",
+            "--src",  o(f"copart_search_{copart_date}.csv"),
+            "--dest", o(f"copart_search_{today}.csv"),
+        ]))
+    else:
+        skip(STEP_REMOVE_DUPLICATES, "no recent copart search file found")
+
+    run_parallel_chains([
+        chain_copart,
+        [(STEP_IAAI_SEARCH, [
+            py, s("iaai_search.py"),
+            "--input",       str(filters / "iaai_filters.csv"),
+            "--output",      o(f"iaai_search_{today}.csv"),
+            "--profile-dir", str(chrome_profile),
+            *bp,
+        ])],
+    ])
+
+    _car_counts[STEP_COPART_SEARCH] = _count_csv_rows(output / f"copart_search_{today}.csv")
+    _car_counts[STEP_IAAI_SEARCH]   = _count_csv_rows(output / f"iaai_search_{today}.csv")
+
+
+def _phase_bidfax(py, s,
+                  output:       Path,
+                  logs:         Path,
+                  workbook:     str,
+                  bidfax_cache: str,
+                  copart_date:  str | None,
+                  iaai_date:    str | None) -> None:
+    """Phase 2: consolidated bidfax pipeline.
+
+    bidfax_run.py owns sale-ended check + bidfax lookup (Copart-ended +
+    today's IAAI) + In-Progress refresh + workbook updates inside one
+    asyncio.run + one fresh Chrome (no --browser-port). The fresh
+    browser is deliberate: prior split steps shared the daily Chrome and
+    accumulated bidfax cookies / Cloudflare score across phases, which
+    throttled later queries."""
+    bidfax_args = [
+        py, s("bidfax_run.py"),
+        "--dir",      str(output),
+        "--cache",    bidfax_cache,
+        "--log",      str(logs / "bidfax_deletions.json"),
+        "--workbook", workbook,
+    ]
+    if copart_date:
+        bidfax_args += ["--copart-date", copart_date]
+    if iaai_date:
+        bidfax_args += ["--iaai-date", iaai_date]
+    run(STEP_BIDFAX_RUN, bidfax_args)
+
+
 def main() -> None:
     _today     = date.today()
     _yesterday = _today - timedelta(days=1)
@@ -376,7 +475,14 @@ def main() -> None:
                         help="Project root directory (default: current dir)")
     parser.add_argument("--python", default=sys.executable,
                         help="Python interpreter to use (default: current interpreter)")
+    parser.add_argument("--from-step", default="search",
+                        choices=sorted(_FROM_STEP_PHASES.keys()),
+                        help="Skip phases before this one. Useful when "
+                             "an earlier phase already succeeded today and "
+                             "you only want to retry what came after. "
+                             "(default: search — run everything)")
     args = parser.parse_args()
+    from_phase = _FROM_STEP_PHASES[args.from_step]
 
     root    = Path(args.root).resolve()
     py      = args.python
@@ -423,79 +529,44 @@ def main() -> None:
         bidfax_input_count += _count_in_progress(output)
         _car_counts[STEP_BIDFAX_RUN] = bidfax_input_count
 
-        # ---- Phase 1 (parallel chains) -----------------------------------
-        # Chain A: copart_search → remove_duplicates. Step 3 only needs
-        #          step 1's output, so it can start as soon as step 1
-        #          finishes — no need to wait for step 2 (IAAI).
-        # Chain B: iaai_search alone. Browser-bound, the long pole.
-        chain_copart: list[tuple[str, list[str]]] = [
-            (STEP_COPART_SEARCH, [
-                py, s("copart_search.py"),
-                "--input",  str(filters / "copart_filters.csv"),
-                "--output", o(f"copart_search_{today}.csv"),
-            ]),
-        ]
-        if copart_date:
-            chain_copart.append((STEP_REMOVE_DUPLICATES, [
-                py, s("remove_duplicates.py"),
-                "--auction", "copart",
-                "--src",  o(f"copart_search_{copart_date}.csv"),
-                "--dest", o(f"copart_search_{today}.csv"),
-            ]))
+        skip_reason = f"--from-step={args.from_step}"
+
+        if from_phase <= PHASE_SEARCH:
+            _phase_search(py, s, o, bp, output, filters, chrome_profile,
+                          today, copart_date)
         else:
-            skip(STEP_REMOVE_DUPLICATES, "no recent copart search file found")
+            skip(STEP_COPART_SEARCH,     skip_reason)
+            skip(STEP_IAAI_SEARCH,       skip_reason)
+            skip(STEP_REMOVE_DUPLICATES, skip_reason)
 
-        run_parallel_chains([
-            chain_copart,
-            [(STEP_IAAI_SEARCH, [
-                py, s("iaai_search.py"),
-                "--input",       str(filters / "iaai_filters.csv"),
-                "--output",      o(f"iaai_search_{today}.csv"),
-                "--profile-dir", str(chrome_profile),
+        if from_phase <= PHASE_BIDFAX:
+            _phase_bidfax(py, s, output, logs, workbook, bidfax_cache,
+                          copart_date, iaai_date)
+        else:
+            skip(STEP_BIDFAX_RUN, skip_reason)
+
+        if from_phase <= PHASE_WORKBOOK:
+            run(STEP_BUILD_WORKBOOK, [
+                py, s("build_workbook.py"),
+                "--dir",      str(output),
+                "--workbook", workbook,
+                "--log",      str(logs / "processed_files.json"),
+            ])
+        else:
+            skip(STEP_BUILD_WORKBOOK, skip_reason)
+
+        if from_phase <= PHASE_HTML:
+            run(STEP_HTML_REPORT, [
+                py, s("workbook_to_html.py"),
+                "--workbook",     workbook,
+                "--out",          o("html_report"),
+                "--search-dir",   str(output),
+                "--today-date",   today,
+                "--bidfax-cache", bidfax_cache,
                 *bp,
-            ])],
-        ])
-
-        # Phase 1 done — capture how many lots each scraper produced.
-        _car_counts[STEP_COPART_SEARCH] = _count_csv_rows(output / f"copart_search_{today}.csv")
-        _car_counts[STEP_IAAI_SEARCH]   = _count_csv_rows(output / f"iaai_search_{today}.csv")
-
-        # ---- Phase 2 (sequential): consolidated bidfax pipeline ----------
-        # bidfax_run.py owns sale-ended check + bidfax lookup (Copart-ended +
-        # today's IAAI) + In-Progress refresh + workbook updates inside one
-        # asyncio.run + one fresh Chrome (no --browser-port). The fresh
-        # browser is deliberate: prior split steps shared the daily Chrome
-        # and accumulated bidfax cookies / Cloudflare score across phases,
-        # which throttled later queries.
-        bidfax_args = [
-            py, s("bidfax_run.py"),
-            "--dir",      str(output),
-            "--cache",    bidfax_cache,
-            "--log",      str(logs / "bidfax_deletions.json"),
-            "--workbook", workbook,
-        ]
-        if copart_date:
-            bidfax_args += ["--copart-date", copart_date]
-        if iaai_date:
-            bidfax_args += ["--iaai-date", iaai_date]
-        run(STEP_BIDFAX_RUN, bidfax_args)
-
-        run(STEP_BUILD_WORKBOOK, [
-            py, s("build_workbook.py"),
-            "--dir",      str(output),
-            "--workbook", workbook,
-            "--log",      str(logs / "processed_files.json"),
-        ])
-
-        run(STEP_HTML_REPORT, [
-            py, s("workbook_to_html.py"),
-            "--workbook",     workbook,
-            "--out",          o("html_report"),
-            "--search-dir",   str(output),
-            "--today-date",   today,
-            "--bidfax-cache", bidfax_cache,
-            *bp,
-        ])
+            ])
+        else:
+            skip(STEP_HTML_REPORT, skip_reason)
 
     finally:
         chrome_proc.terminate()

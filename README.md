@@ -119,6 +119,25 @@ Run from the project root. All output goes to the `output/` directory.
 python run_daily.py --root /path/to/project
 ```
 
+### Re-running from a specific phase
+
+When part of the daily flow already succeeded today and you only want to retry what came after, use `--from-step` to skip earlier phases. The choices map to the four execution phases:
+
+| `--from-step` | Skips | Runs |
+|---------------|-------|------|
+| `search` (default) | nothing | everything |
+| `bidfax` | Copart + IAAI search | bidfax pipeline → workbook → HTML |
+| `workbook` | searches + bidfax | workbook → HTML |
+| `html` | everything except HTML | HTML report only |
+
+Most common case — bidfax got soft-blocked or the daily run hit Cloudflare and you don't want to re-scrape:
+
+```bash
+python run_daily.py --from-step bidfax
+```
+
+Skipped steps appear in the run summary as `[SKIPPED] (--from-step=bidfax)` so you can tell what was deliberately bypassed vs what genuinely had no work to do.
+
 ---
 
 ## Running individual scripts
