@@ -116,13 +116,21 @@ def build_lot_url(lot: dict) -> str:
         or str(lot.get("lotNumber", ""))
         or ""
     )
-    description = (
-        lot.get("ld")
-        or lot.get("lotName")
-        or lot.get("description")
-        or ""
-    ).lower()
-    slug = re.sub(r"[^a-z0-9]+", "-", description).strip("-")
+    # Copart's API ships the canonical URL slug as `ldu` — using it
+    # produces stable links like "salvage-2024-audi-a6-premium-al-tanner"
+    # which load the real lot page and reliably show "Sale ended" when
+    # the auction is over. Slugifying `ld` ourselves loses the "salvage-"
+    # prefix + location suffix, and the resulting URL can land on a
+    # redirect/lookup page that doesn't surface sale-ended consistently.
+    slug = (lot.get("ldu") or "").strip()
+    if not slug:
+        description = (
+            lot.get("ld")
+            or lot.get("lotName")
+            or lot.get("description")
+            or ""
+        ).lower()
+        slug = re.sub(r"[^a-z0-9]+", "-", description).strip("-")
     if slug:
         return f"{BASE_URL}/lot/{lot_number}/{slug}"
     return f"{BASE_URL}/lot/{lot_number}"

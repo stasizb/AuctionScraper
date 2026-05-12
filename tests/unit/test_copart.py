@@ -115,6 +115,26 @@ class TestCopartSearchHelpers(unittest.TestCase):
         lot = {"ld": "2024 AUDI Q5 PREMIUM PLUS"}
         self.assertFalse(copart_search.equipment_ok(lot, "Premium 45"))
 
+    def test_build_lot_url_prefers_ldu(self):
+        # `ldu` is the canonical URL slug Copart's API ships — should be
+        # used verbatim, not re-derived from `ld`. This is what makes the
+        # downstream "Sale ended" check hit the right page.
+        lot = {"ln": "84082334",
+               "ld":  "2024 AUDI A6 PREMIUM",
+               "ldu": "salvage-2024-audi-a6-premium-al-tanner"}
+        url = copart_search.build_lot_url(lot)
+        self.assertEqual(
+            url,
+            "https://www.copart.com/lot/84082334/"
+            "salvage-2024-audi-a6-premium-al-tanner",
+        )
+
+    def test_build_lot_url_falls_back_to_ld_slugify(self):
+        # Legacy payloads without `ldu` still produce a usable URL.
+        lot = {"ln": "12345", "ld": "Honda CR-V Hybrid"}
+        url = copart_search.build_lot_url(lot)
+        self.assertEqual(url, "https://www.copart.com/lot/12345/honda-cr-v-hybrid")
+
     def test_lot_to_row(self):
         lot = {
             "ln":  "12345",
