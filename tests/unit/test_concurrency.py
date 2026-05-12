@@ -18,14 +18,26 @@ import core.concurrency as concurrency_mod
 import core.env         as env_mod
 
 
-def _reload(env: dict[str, str] | None = None) -> int:
-    """Reload core.concurrency under the given env, returning the new value."""
+_CONCURRENCY_VARS = (
+    "DEFAULT_TAB_CONCURRENCY",
+    "IAAI_TAB_CONCURRENCY",
+    "BIDFAX_TAB_CONCURRENCY",
+)
+
+
+def _reload(env: dict[str, str] | None = None,
+            attr: str = "DEFAULT_TAB_CONCURRENCY") -> int:
+    """Reload core.concurrency under the given env, returning `attr`'s value.
+
+    Any concurrency env var not present in `env` is cleared, so callers
+    don't have to worry about stale state leaking between tests."""
     env = env or {}
     with patch.dict(os.environ, env, clear=False):
-        if "DEFAULT_TAB_CONCURRENCY" not in env:
-            os.environ.pop("DEFAULT_TAB_CONCURRENCY", None)
+        for var in _CONCURRENCY_VARS:
+            if var not in env:
+                os.environ.pop(var, None)
         importlib.reload(concurrency_mod)
-        return concurrency_mod.DEFAULT_TAB_CONCURRENCY
+        return getattr(concurrency_mod, attr)
 
 
 class _DotenvSandbox:
@@ -54,7 +66,8 @@ class TestDefaultTabConcurrency(unittest.TestCase):
     """Env-var path: process env > .env > default."""
 
     def tearDown(self):
-        os.environ.pop("DEFAULT_TAB_CONCURRENCY", None)
+        for var in _CONCURRENCY_VARS:
+            os.environ.pop(var, None)
         importlib.reload(concurrency_mod)
 
     def test_unset_env_with_repo_dotenv_uses_dotenv_value(self):
@@ -128,11 +141,69 @@ class TestRedirectedToClients(unittest.TestCase):
         from clients import iaai as iaai_client
         self.assertEqual(iaai_client.DEFAULT_TAB_CONCURRENCY,
                          concurrency_mod.DEFAULT_TAB_CONCURRENCY)
+        self.assertEqual(iaai_client.IAAI_TAB_CONCURRENCY,
+                         concurrency_mod.IAAI_TAB_CONCURRENCY)
 
     def test_bidfax_reexports_default_tab_concurrency(self):
         from clients import bidfax
         self.assertEqual(bidfax.DEFAULT_TAB_CONCURRENCY,
                          concurrency_mod.DEFAULT_TAB_CONCURRENCY)
+        self.assertEqual(bidfax.BIDFAX_TAB_CONCURRENCY,
+                         concurrency_mod.BIDFAX_TAB_CONCURRENCY)
+
+
+class TestPerSiteOverrides(unittest.TestCase):
+    """IAAI_TAB_CONCURRENCY / BIDFAX_TAB_CONCURRENCY override the shared default
+    but still fall back to it when unset."""
+
+    def tearDown(self):
+        for var in _CONCURRENCY_VARS:
+            os.environ.pop(var, None)
+        importlib.reload(concurrency_mod)
+
+    def test_iaai_inherits_default_when_unset(self):
+        self.assertEqual(
+            _reload({"DEFAULT_TAB_CONCURRENCY": "5"}, attr="IAAI_TAB_CONCURRENCY"), 5)
+
+    def test_bidfax_inherits_default_when_unset(self):
+        self.assertEqual(
+            _reload({"DEFAULT_TAB_CONCURRENCY": "5"}, attr="BIDFAX_TAB_CONCURRENCY"), 5)
+
+    def test_iaai_override_does_not_leak_to_bidfax(self):
+        # Setting IAAI must not change BIDFAX (and vice-versa); they're independent.
+        with patch.dict(os.environ, {
+            "DEFAULT_TAB_CONCURRENCY": "2",
+            "IAAI_TAB_CONCURRENCY":    "7",
+        }, clear=False):
+            os.environ.pop("BIDFAX_TAB_CONCURRENCY", None)
+            importlib.reload(concurrency_mod)
+            self.assertEqual(concurrency_mod.IAAI_TAB_CONCURRENCY,   7)
+            self.assertEqual(concurrency_mod.BIDFAX_TAB_CONCURRENCY, 2)
+            self.assertEqual(concurrency_mod.DEFAULT_TAB_CONCURRENCY, 2)
+
+    def test_bidfax_override_does_not_leak_to_iaai(self):
+        with patch.dict(os.environ, {
+            "DEFAULT_TAB_CONCURRENCY": "2",
+            "BIDFAX_TAB_CONCURRENCY":  "8",
+        }, clear=False):
+            os.environ.pop("IAAI_TAB_CONCURRENCY", None)
+            importlib.reload(concurrency_mod)
+            self.assertEqual(concurrency_mod.BIDFAX_TAB_CONCURRENCY, 8)
+            self.assertEqual(concurrency_mod.IAAI_TAB_CONCURRENCY,   2)
+
+    def test_per_site_malformed_falls_back_to_default(self):
+        # Bad IAAI value → falls back to DEFAULT, not the hardcoded 2, so a
+        # team-wide DEFAULT bump still applies.
+        self.assertEqual(
+            _reload({"DEFAULT_TAB_CONCURRENCY": "3",
+                     "IAAI_TAB_CONCURRENCY":    "lots"},
+                    attr="IAAI_TAB_CONCURRENCY"), 3)
+
+    def test_per_site_zero_falls_back_to_default(self):
+        self.assertEqual(
+            _reload({"DEFAULT_TAB_CONCURRENCY": "3",
+                     "BIDFAX_TAB_CONCURRENCY":  "0"},
+                    attr="BIDFAX_TAB_CONCURRENCY"), 3)
 
 
 if __name__ == "__main__":

@@ -104,6 +104,17 @@ class TestCopartSearchHelpers(unittest.TestCase):
         lot = {"ld": "Honda CR-V TOURING 2024", "lcy": 2024, "ad": 1700000000000}
         self.assertTrue(copart_search.equipment_ok(lot, "Touring"))
 
+    def test_equipment_ok_multiword_interleaved(self):
+        # "Premium 45" must match a title where another token sits between
+        # the two words ("Premium Plus 45") — each word is checked
+        # independently, not as a concatenated substring.
+        lot = {"ld": "2024 AUDI Q5 PREMIUM PLUS 45  "}
+        self.assertTrue(copart_search.equipment_ok(lot, "Premium 45"))
+
+    def test_equipment_ok_multiword_missing_one(self):
+        lot = {"ld": "2024 AUDI Q5 PREMIUM PLUS"}
+        self.assertFalse(copart_search.equipment_ok(lot, "Premium 45"))
+
     def test_lot_to_row(self):
         lot = {
             "ln":  "12345",

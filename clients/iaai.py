@@ -27,7 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.chrome      import find_chrome
 from core.dates       import normalize_auction_date
 from core.debug       import DEBUG_SCREENSHOTS
-from core.concurrency import DEFAULT_TAB_CONCURRENCY  # noqa: F401  (re-exported)
+from core.concurrency import (  # noqa: F401  (re-exported)
+    DEFAULT_TAB_CONCURRENCY,
+    IAAI_TAB_CONCURRENCY,
+)
 from core.job_log     import job_log
 
 try:
@@ -63,10 +66,10 @@ WAIT_LONG   = 5.0
 # (rather than session state) authority over the starting filters.
 _BAKED_ODO_MAX = 30000
 
-# DEFAULT_TAB_CONCURRENCY is re-exported from core.concurrency (set via the
-# DEFAULT_TAB_CONCURRENCY env var or the project-root .env file). It controls
-# how many filter rows scrape in parallel tabs; raising it speeds things up
-# but risks IAAI throttling.
+# IAAI_TAB_CONCURRENCY is re-exported from core.concurrency. It controls how
+# many filter rows scrape in parallel tabs; raising it speeds things up but
+# risks IAAI throttling. Set via the IAAI_TAB_CONCURRENCY env var (or, if
+# unset, falls back to the shared DEFAULT_TAB_CONCURRENCY).
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +163,7 @@ class BrowserIAAIClient:
         self._browser_port = browser_port
         self._profile_dir  = profile_dir
         if tab_concurrency is None:
-            tab_concurrency = DEFAULT_TAB_CONCURRENCY
+            tab_concurrency = IAAI_TAB_CONCURRENCY
         self._tab_concurrency = max(1, tab_concurrency)
 
     # ---- Public interface --------------------------------------------------

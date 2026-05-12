@@ -91,7 +91,7 @@ def lookup_lots(
     delay: float,
     browser_port: int | None,
     client: bidfax.BidfaxClient | None = None,
-    max_concurrent: int = bidfax.DEFAULT_TAB_CONCURRENCY,
+    max_concurrent: int = bidfax.BIDFAX_TAB_CONCURRENCY,
     makes: dict[str, str] | None = None,
     cache_path: Path | None = None,
 ) -> dict[str, tuple[str, str, str]]:
@@ -319,9 +319,10 @@ def main() -> None:
                         help="Seconds between bidfax searches (default: 2.0)")
     parser.add_argument("--browser-port",   type=int, default=None,
                         help="Connect to a running Chrome on this port instead of launching one")
-    parser.add_argument("--concurrent",     type=int, default=bidfax.DEFAULT_TAB_CONCURRENCY,
-                        help=f"Parallel bidfax tabs (default: {bidfax.DEFAULT_TAB_CONCURRENCY}; "
-                             f"override via DEFAULT_TAB_CONCURRENCY env var or .env file)")
+    parser.add_argument("--concurrent",     type=int, default=bidfax.BIDFAX_TAB_CONCURRENCY,
+                        help=f"Parallel bidfax tabs (default: {bidfax.BIDFAX_TAB_CONCURRENCY}; "
+                             f"override via BIDFAX_TAB_CONCURRENCY / DEFAULT_TAB_CONCURRENCY "
+                             f"env var or .env file)")
     parser.add_argument("--cache",    "-c", default="caches/bidfax_cache.json",
                         help="Cache file to update with re-fetched results "
                              "(default: caches/bidfax_cache.json)")

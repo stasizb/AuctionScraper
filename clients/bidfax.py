@@ -27,7 +27,10 @@ from typing import Protocol, runtime_checkable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.concurrency import DEFAULT_TAB_CONCURRENCY
+from core.concurrency import (  # DEFAULT_* kept for back-compat with importers
+    BIDFAX_TAB_CONCURRENCY,
+    DEFAULT_TAB_CONCURRENCY,  # noqa: F401  (re-exported)
+)
 from core.debug       import DEBUG_SCREENSHOTS
 from core.job_log     import job_log
 
@@ -90,7 +93,7 @@ class BidfaxClient(Protocol):
         queries: list[str],
         makes: dict[str, str] | None = None,
         delay: float = 2.0,
-        max_concurrent: int = DEFAULT_TAB_CONCURRENCY,
+        max_concurrent: int = BIDFAX_TAB_CONCURRENCY,
     ) -> dict[str, tuple[str, str, str]]:
         """Search each query. Returns {query: (price, vin, url)}.
 
@@ -138,7 +141,7 @@ class BrowserBidfaxClient:
         queries: list[str],
         makes: dict[str, str] | None = None,
         delay: float = 2.0,
-        max_concurrent: int = DEFAULT_TAB_CONCURRENCY,
+        max_concurrent: int = BIDFAX_TAB_CONCURRENCY,
     ) -> dict[str, tuple[str, str, str]]:
         if not queries:
             return {}
@@ -179,7 +182,7 @@ class BrowserBidfaxClient:
         queries: list[str],
         makes: dict[str, str],
         delay: float,
-        max_concurrent: int = DEFAULT_TAB_CONCURRENCY,
+        max_concurrent: int = BIDFAX_TAB_CONCURRENCY,
     ) -> dict[str, tuple[str, str, str]]:
         browser = await self._start_browser()
         try:
@@ -275,7 +278,7 @@ class FakeBidfaxClient:
         queries: list[str],
         makes: dict[str, str] | None = None,
         delay: float = 2.0,
-        max_concurrent: int = DEFAULT_TAB_CONCURRENCY,
+        max_concurrent: int = BIDFAX_TAB_CONCURRENCY,
     ) -> dict[str, tuple[str, str, str]]:
         del makes, delay, max_concurrent  # accepted for protocol parity; fake ignores
         self.lookup_calls.extend(queries)
@@ -304,7 +307,7 @@ def run_batch(
     makes: dict[str, str] | None = None,
     browser_port: int | None = None,
     client: BidfaxClient | None = None,
-    max_concurrent: int = DEFAULT_TAB_CONCURRENCY,
+    max_concurrent: int = BIDFAX_TAB_CONCURRENCY,
 ) -> dict[str, tuple]:
     """Search bidfax for each query, using disk cache to skip known results.
 
@@ -336,7 +339,7 @@ def run_batch_vins(
     cache_path: Path,
     browser_port: int | None = None,
     client: BidfaxClient | None = None,
-    max_concurrent: int = DEFAULT_TAB_CONCURRENCY,
+    max_concurrent: int = BIDFAX_TAB_CONCURRENCY,
 ) -> dict[str, str]:
     """Search bidfax.info for each VIN, returning {vin: url}. Disk-cached."""
     if client is None and not _DEPS_OK:

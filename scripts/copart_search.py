@@ -131,7 +131,13 @@ def build_lot_url(lot: dict) -> str:
 def equipment_ok(lot: dict, equipment: str | None) -> bool:
     if not equipment:
         return True
-    eq = re.sub(r"[\s\-]+", "", equipment.lower())
+    # Multi-word equipment ("Premium 45") matches when every word appears
+    # in the haystack, in any order — Copart sometimes interleaves trim
+    # tokens ("Premium Plus 45") so a single concatenated substring check
+    # would miss valid lots.
+    words = [re.sub(r"[\s\-]+", "", w.lower()) for w in equipment.split() if w.strip()]
+    if not words:
+        return True
     # The trim ("4MATIC", "Touring", "Premium 45", ...) can live in any of
     # several Copart API fields depending on the lot — `ld`, `lm`, `lcd`,
     # `tlt`, etc. — and Copart's frontend reassembles the displayed title
@@ -142,7 +148,7 @@ def equipment_ok(lot: dict, equipment: str | None) -> bool:
         if isinstance(v, str):
             haystack_parts.append(v)
     haystack = re.sub(r"[\s\-]+", "", " ".join(haystack_parts).lower())
-    return eq in haystack
+    return all(w in haystack for w in words)
 
 
 # ---------------------------------------------------------------------------

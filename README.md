@@ -153,18 +153,34 @@ python scripts/iaai_search.py --tab-concurrency 1        # disable parallel tabs
 python scripts/iaai_search.py --tab-concurrency 4        # bump parallelism (watch for IAAI throttling)
 ```
 
-`iaai_search.py` scrapes filter rows in parallel browser tabs, and the bidfax price scripts (`bidfax_info.py`, `price_refresh.py`, `price_fix.py`) accept `--concurrent` for the same purpose. Both default to **2 tabs**, sourced from `core.concurrency.DEFAULT_TAB_CONCURRENCY`. Resolution order:
+`iaai_search.py` scrapes filter rows in parallel browser tabs, and the bidfax price scripts (`bidfax_info.py`, `price_refresh.py`, `price_fix.py`) accept `--concurrent` for the same purpose. Both default to **2 tabs**.
 
-1. Process env var `DEFAULT_TAB_CONCURRENCY` (set in shell / CI)
-2. `.env` file at the project root (committed, edit to change the team default)
-3. Hardcoded fallback `2`
+Three knobs live in `core.concurrency`:
+
+| Constant                  | Env var                  | Used by             |
+|---------------------------|--------------------------|---------------------|
+| `DEFAULT_TAB_CONCURRENCY` | `DEFAULT_TAB_CONCURRENCY`| Shared fallback     |
+| `IAAI_TAB_CONCURRENCY`    | `IAAI_TAB_CONCURRENCY`   | `iaai_search.py`    |
+| `BIDFAX_TAB_CONCURRENCY`  | `BIDFAX_TAB_CONCURRENCY` | bidfax price scripts|
+
+Resolution order for each (first hit wins):
+
+1. Process env var (set in shell / CI)
+2. `.env` file at the project root
+3. For per-site vars: `DEFAULT_TAB_CONCURRENCY` (so setting only the shared knob still controls both)
+4. Hardcoded fallback `2`
 
 ```bash
-# One-off shell override
+# One-off shell override of both sites
 export DEFAULT_TAB_CONCURRENCY=4 && python run_daily.py
 
-# Persistent change for everyone — edit the .env file:
+# Tune only bidfax (e.g. IAAI is rate-limited but bidfax isn't)
+export BIDFAX_TAB_CONCURRENCY=4 && python run_daily.py
+
+# Persistent change — edit the .env file:
 #   DEFAULT_TAB_CONCURRENCY=1
+#   IAAI_TAB_CONCURRENCY=2
+#   BIDFAX_TAB_CONCURRENCY=4
 ```
 
 Raising parallelism speeds things up but increases the chance IAAI / bidfax rate-limit the session. Per-run CLI flags (`--tab-concurrency`, `--concurrent`) still override everything.

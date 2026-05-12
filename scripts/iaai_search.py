@@ -76,9 +76,10 @@ def cli() -> None:
     parser.add_argument("--browser-port", type=int, default=None,
                         help="Connect to a running Chrome on this port instead of launching one")
     parser.add_argument("--tab-concurrency", type=int,
-                        default=iaai_client.DEFAULT_TAB_CONCURRENCY,
+                        default=iaai_client.IAAI_TAB_CONCURRENCY,
                         help=f"How many filter rows to scrape in parallel tabs "
-                             f"(default: {iaai_client.DEFAULT_TAB_CONCURRENCY})")
+                             f"(default: {iaai_client.IAAI_TAB_CONCURRENCY}; "
+                             f"override via IAAI_TAB_CONCURRENCY env var or .env)")
     args = parser.parse_args()
 
     if not Path(args.input).exists():

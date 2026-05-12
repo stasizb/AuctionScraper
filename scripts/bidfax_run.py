@@ -712,9 +712,11 @@ def main() -> None:
     parser.add_argument("--delay",       type=float, default=2.0,
                         help="Seconds between bidfax searches (default: 2.0)")
     parser.add_argument("--concurrent",  type=int,
-                        default=bidfax.DEFAULT_TAB_CONCURRENCY,
+                        default=bidfax.BIDFAX_TAB_CONCURRENCY,
                         help=f"Parallel bidfax tabs (default: "
-                             f"{bidfax.DEFAULT_TAB_CONCURRENCY})")
+                             f"{bidfax.BIDFAX_TAB_CONCURRENCY}; override via "
+                             f"BIDFAX_TAB_CONCURRENCY / DEFAULT_TAB_CONCURRENCY "
+                             f"env var or .env)")
     parser.add_argument("--stale-cutoff-days", type=int,
                         default=DEFAULT_STALE_DAYS,
                         help=f"In-Progress rows whose auction date is older "
