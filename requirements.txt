@@ -7,3 +7,6 @@ requests           # HTTP client (Copart's public lots API)
 beautifulsoup4     # HTML parsing for bidfax results + price_fix HTML rewrite
 lxml               # bs4's fastest parser backend
 openpyxl           # Excel workbook read/write (auction_results.xlsx)
+playwright         # Cookie warmup for copart_search_api.py (nodriver's
+                   # cookie helpers hang on Copart — known nodriver bug).
+                   # First-time setup: python -m playwright install chromium
