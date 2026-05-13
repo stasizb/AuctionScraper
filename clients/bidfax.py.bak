@@ -48,8 +48,11 @@ except ImportError:
 
 BIDFAX_HOME     = "https://bidfax.info"
 IN_PROGRESS     = "In Progress"
+SALE_ENDED_TEXT = "Sale ended"
 
 _CF_WAIT_TIMEOUT    = 30.0
+_COPART_RENDER_WAIT = 4.0
+_MAX_CONCURRENT     = 5
 
 _BIDFAX_HOME_PATH = re.compile(r'^https?://bidfax\.info/?$')
 # RESULT_URL_RE / VIN_FROM_URL_RE live in bidfax_parsing — re-exported below
@@ -147,23 +150,9 @@ class BrowserBidfaxClient:
         )
 
     def check_sale_ended_many(self, lot_urls: list[str]) -> dict[str, bool]:
-        """Determine sale-ended state for each Copart lot URL.
-
-        Now uses Copart's public search API rather than opening a browser
-        per lot: a lot whose number is absent from the search index has
-        had its auction concluded. The Playwright cookie warmup is shared
-        with copart_search.py via clients.copart_session, so the daily
-        run typically pays the browser cost exactly once. Legacy
-        nodriver-based implementation is in clients/bidfax.py.bak.
-        """
         if not lot_urls:
             return {}
-        # Local import: keeps this module importable without playwright
-        # installed (the actual Playwright call is inside copart_session).
-        from clients.copart_session import get_or_warmup_session
-        from clients.copart         import check_sale_ended_via_search
-        session = get_or_warmup_session()
-        return check_sale_ended_via_search(session, lot_urls)
+        return asyncio.run(self._sale_ended_many_async(lot_urls))
 
     def lookup(self, query: str, expected_make: str = "") -> tuple[str, str, str]:
         makes = {query: expected_make} if expected_make else None
@@ -247,6 +236,23 @@ class BrowserBidfaxClient:
 
         pairs = await asyncio.gather(*(_worker(q) for q in queries))
         return dict(pairs)
+
+    async def _sale_ended_many_async(self, lot_urls: list[str]) -> dict[str, bool]:
+        browser = await self._start_browser()
+        try:
+            sem = asyncio.Semaphore(_MAX_CONCURRENT)
+            async def _one(url: str) -> tuple[str, bool]:
+                async with sem:
+                    tab = await browser.get(url, new_tab=True)
+                    await asyncio.sleep(_COPART_RENDER_WAIT)
+                    ended = SALE_ENDED_TEXT in await tab.get_content()
+                    await tab.close()
+                    return url, ended
+            pairs = await asyncio.gather(*(_one(u) for u in lot_urls))
+            return dict(pairs)
+        finally:
+            await self._stop_browser(browser)
+
 
 # ---------------------------------------------------------------------------
 # Fake (in-memory) implementation for tests

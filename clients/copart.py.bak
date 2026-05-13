@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """
-CopartClient abstraction — wraps Copart's internal JSON search API.
+CopartClient abstraction — wraps HTTP access to Copart's internal search API.
 
-  - CopartClient        — the interface scripts depend on
-  - SessionCopartClient — real implementation; takes a session pre-warmed
-                          by clients.copart_session (Playwright cookies)
-  - FakeCopartClient    — test double that returns canned lot lists
+  - CopartClient      — the interface scripts depend on
+  - HttpCopartClient  — real implementation using requests
+  - FakeCopartClient  — test double that returns canned lot lists
 
-Also exposes the no-browser sale-ended probe (check_sale_ended_via_search),
-which reuses the same session.
-
-Legacy plain-requests warmup (HttpCopartClient) lives in clients/copart.py.bak —
-Incapsula started 403'ing it consistently, which is why everything now
-goes through the Playwright-warmed session.
+Copart has no browser requirement (pure HTTP/JSON), so there is no context-
+manager lifecycle — clients are cheap to instantiate.
 """
 
 from __future__ import annotations
@@ -37,6 +32,17 @@ except ImportError:
 BASE_URL       = "https://www.copart.com"
 SEARCH_API_URL = f"{BASE_URL}/public/lots/search-results"
 PAGE_SIZE      = 100
+
+HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Content-Type":    "application/json",
+    "Origin":          BASE_URL,
+    "Referer":         f"{BASE_URL}/lotSearchResults/",
+}
 
 log = logging.getLogger(__name__)
 
@@ -205,25 +211,36 @@ class CopartClient(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Real implementation — uses a pre-warmed requests.Session (cookies from
-# clients.copart_session). Plain-requests warmup got 403'd reliably enough
-# that the Playwright-cookie path is now the default — see
-# clients/copart.py.bak for the legacy HttpCopartClient.
+# Real (HTTP-backed) implementation
 # ---------------------------------------------------------------------------
 
-class SessionCopartClient:
-    """Live copart.com client. Takes a `requests.Session` already carrying
-    Copart's bot-defense cookies (from `clients.copart_session.get_or_warmup_session()`)
-    and walks the search-results pages via the internal JSON API."""
+class HttpCopartClient:
+    """Live copart.com client — walks all result pages via the internal JSON API."""
 
-    def __init__(self, session, request_delay: float = 2.0) -> None:
+    def __init__(self, request_delay: float = 2.0) -> None:
         if not _REQUESTS_OK:
             raise RuntimeError("requests is required. Install with:  pip install requests")
-        self._session = session
         self.request_delay = request_delay
+        self._session: "requests.Session | None" = None
+
+    def _session_ready(self) -> "requests.Session":
+        if self._session is not None:
+            return self._session
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        for url in (BASE_URL, f"{BASE_URL}/lotSearchResults/"):
+            try:
+                r = s.get(url, timeout=15)
+                log.info(f"Warmup {url}: HTTP {r.status_code} | cookies: {list(s.cookies.keys())}")
+            except requests.RequestException as e:
+                # Warmup is best-effort: cookie collection helps avoid CDN
+                # quirks but the search call below works without it too.
+                log.warning(f"Warmup {url} failed: {e}")
+        self._session = s
+        return s
 
     def fetch_lots(self, filters: dict) -> list[dict]:
-        session  = self._session
+        session  = self._session_ready()
         all_lots: list[dict] = []
         page     = 0
 
@@ -238,9 +255,13 @@ class SessionCopartClient:
                 log.error(f"  HTTP {e.response.status_code}: {e.response.text[:600]}")
                 break
             except requests.RequestException as e:
+                # Connection / timeout / SSL etc. — bail rather than spin
+                # forever on transient network problems.
                 log.error(f"  Request error: {e}")
                 break
             except ValueError as e:
+                # JSON decode failed — Copart returned non-JSON (HTML
+                # error page, rate-limit response, etc.).
                 log.error(f"  Bad JSON response: {e}")
                 break
 

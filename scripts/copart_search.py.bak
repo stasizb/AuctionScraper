@@ -37,7 +37,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from clients import copart as copart_client
-from clients.copart_session import get_or_warmup_session
 from core.filters import apply_age_filter
 
 # ---------------------------------------------------------------------------
@@ -257,13 +256,7 @@ def main():
         log.error("No filter rows found. Check your CSV format.")
         return
 
-    # Shared Playwright cookie warmup (with on-disk cache). The same
-    # session is then reused by bidfax_run.py's Sale-Ended phase when it
-    # runs later in the same daily window — so the Chromium launch
-    # amortizes over both Copart-API consumers.
-    log.info("Acquiring Copart session (Playwright warmup or cached cookies)...")
-    session  = get_or_warmup_session()
-    client   = copart_client.SessionCopartClient(session=session, request_delay=args.delay)
+    client   = copart_client.HttpCopartClient(request_delay=args.delay)
     all_rows = []
 
     for idx, filters in enumerate(filters_list, 1):
