@@ -375,30 +375,47 @@ class TestSearchOncePollBudget(unittest.IsolatedAsyncioTestCase):
     iterations regardless of CF state — so a slow CF clear left zero polls
     to find the grid, and bidfax results were silently dropped."""
 
-    async def _drive(self, page_html_sequence, csrf_token: str = "valid-csrf-token"):
+    async def _drive(self, page_html_sequence, csrf_token: str = "valid-csrf-token",
+                     post_submit_url: str = "https://bidfax.info/results/foo"):
         """Simulate `page.get_content()` returning each item in sequence.
 
         `csrf_token` controls what `_ensure_search_tokens`'s
         page.evaluate('…') returns (the harvested #token2 value). Default
         is non-empty so existing tests don't care about the token wait.
+
+        `post_submit_url` is the URL the FakePage transitions to on
+        `#submit` click. Defaults to a result page so happy-path tests
+        see the expected navigation; the bounce test sets this to the
+        homepage to simulate the server rejecting our submission.
         """
         import clients.bidfax as bf
 
         seq = iter(page_html_sequence)
 
         class FakePage:
-            url = "https://bidfax.info/results/foo"
+            def __init__(self):
+                # Tests now exercise the no-reload flow: we start on the
+                # homepage and the URL mutates on submit-click below.
+                self.url = "https://bidfax.info/"
+                self._post_submit_url = post_submit_url
             async def get(self, _url):
                 await _REAL_ASYNCIO_SLEEP(0)
-            async def find(self, _sel):
+                self.url = _url
+            async def find(self, sel):
                 # _fill_and_submit needs both #search and #submit to exist
                 await _REAL_ASYNCIO_SLEEP(0)
+                page = self
                 class _El:
-                    async def click(self): await _REAL_ASYNCIO_SLEEP(0)
+                    async def click(self):
+                        await _REAL_ASYNCIO_SLEEP(0)
+                        if sel == "#submit":
+                            page.url = page._post_submit_url
                     async def send_keys(self, _v): await _REAL_ASYNCIO_SLEEP(0)
                 return _El()
             async def evaluate(self, _js):
-                # _ensure_search_tokens reads / harvests the #token2 value
+                # _ensure_search_tokens reads / harvests the #token2 value;
+                # _fill_and_submit also runs a small reset script that
+                # returns nothing useful — both paths funnel through here.
                 await _REAL_ASYNCIO_SLEEP(0)
                 return csrf_token
             async def get_content(self):
@@ -441,15 +458,21 @@ class TestSearchOncePollBudget(unittest.IsolatedAsyncioTestCase):
 
     async def test_homepage_bounce_raises_bidfax_bounce(self):
         """Regression for the May 2026 reCAPTCHA-bounce issue: bidfax sometimes
-        accepts the URL transition (querystring) but re-renders the homepage
-        because the reCAPTCHA token wasn't validated. _search_once must
-        signal this with `_BidfaxBounce` so the caller can retry; if it
-        returned IN_PROGRESS instead, transient bounces would be lost
-        without a chance to recover via fresh navigation + fresh token."""
+        rejects our submission and bounces us back to the homepage.
+        `_search_once` must signal this with `_BidfaxBounce` so the caller
+        can decide whether to retry; if it returned IN_PROGRESS instead,
+        transient bounces would be lost.
+
+        Detection is now URL-based (post-submit URL is back at the
+        homepage), so the test simulates a bounce by leaving the FakePage
+        URL on the homepage after submit-click.
+        """
         from clients.bidfax import _BidfaxBounce
-        homepage = '<html><body><input type="text" id="search"></body></html>'
         with self.assertRaises(_BidfaxBounce):
-            await self._drive([homepage] + ["<html>x</html>"] * 30)
+            await self._drive(
+                ["<html>bounced</html>"] + ["<html>x</html>"] * 30,
+                post_submit_url="https://bidfax.info/",
+            )
 
     async def test_empty_csrf_token_aborts_submission(self):
         """When the CSRF token never appears (no rel=alternate, no JS run),

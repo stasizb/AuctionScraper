@@ -558,7 +558,30 @@ async def _fill_and_submit(page, query: str) -> bool:
     search_input = await page.find("#search")
     if not search_input:
         return False
-    await asyncio.sleep(2)
+    # Reset any state left over from a previous search on this page —
+    # bidfax's #search form lives on result pages too, so we reuse the
+    # page across lots instead of reloading. Specifically:
+    #   - #search may still hold the previous query text → send_keys
+    #     would append to it.
+    #   - #token2 still holds the previous reCAPTCHA token (single-use,
+    #     server rejects reuse), so the harvest JS would short-circuit
+    #     and return the stale value. Clearing + resetting the trigger
+    #     gate forces a fresh grecaptcha.execute() this round.
+    try:
+        await page.evaluate(
+            "(function(){"
+            "var i=document.getElementById('search');"
+            "if(i){i.value='';i.dispatchEvent(new Event('input',{bubbles:true}));}"
+            "var t=document.getElementById('token2');  if(t) t.value='';"
+            "var a=document.getElementById('action2'); if(a) a.value='';"
+            "window._auctionsRecaptchaTriggered=false;"
+            "})()"
+        )
+    except Exception:
+        # First search on a brand-new tab has no stale state to clear;
+        # the script can silently no-op there.
+        pass
+    await asyncio.sleep(0.3)
     await search_input.click()
     await asyncio.sleep(0.5)
     await search_input.send_keys(query)
@@ -585,26 +608,33 @@ async def _fill_and_submit(page, query: str) -> bool:
     return True
 
 
-async def _wait_for_navigation(page) -> bool:
+async def _wait_for_navigation(page, start_url: str = "") -> bool:
+    """Wait up to ~10s for `page.url` to differ from `start_url`.
+
+    `start_url` lets us detect navigation when reusing the same page
+    across multiple lots (we may start on a previous result URL, not on
+    the homepage). When `start_url` is empty, falls back to the legacy
+    'wait until not on homepage' check so we stay correct for any old
+    callers."""
     for _ in range(10):
         await asyncio.sleep(1)
         try:
-            current_url = page.url
+            current_url = page.url or ""
         except Exception:
             current_url = ""
-        if current_url and not _BIDFAX_HOME_PATH.match(current_url):
-            return True
+        if not current_url:
+            continue
+        if start_url:
+            if current_url != start_url:
+                return True
+        else:
+            if not _BIDFAX_HOME_PATH.match(current_url):
+                return True
     return False
 
 
 _GRID_POLL_BUDGET     = 10   # polls (1s each) AFTER Cloudflare clears
 _TOTAL_POLL_HARD_CAP  = 30   # safety net so we never spin forever
-
-# Marker that's only on the bidfax homepage (the search-input element by id).
-# Search-result pages don't render this input, so its presence after a
-# submission means the server bounced us back without searching.
-_HOMEPAGE_MARKER = 'id="search"'
-
 
 class _BidfaxBounce(Exception):
     """Server accepted the URL transition but rendered the homepage instead
@@ -624,14 +654,44 @@ async def _search_once(page, query: str) -> tuple[str, str, str]:
     grid-extraction budget — otherwise a slow CF challenge consumes all the
     polls and we bail before the result grid has a chance to render.
 
-    Raises `_BidfaxBounce` when the page returns to the homepage layout
-    after submit (reCAPTCHA score too low / rate-limit). The caller can
-    decide whether to retry with a fresh page.
+    Raises `_BidfaxBounce` when the server redirects us back to the
+    homepage after submit (reCAPTCHA score too low / rate-limit). The
+    caller can decide whether to retry.
+
+    The page is reused across lots: we don't reload `BIDFAX_HOME` between
+    queries, we just clear the previous query state in `_fill_and_submit`
+    and submit a fresh search. So bounce detection looks at the final URL
+    (= homepage) rather than at page HTML.
     """
     try:
+        try:
+            start_url = page.url or ""
+        except Exception:
+            start_url = ""
+
         if not await _fill_and_submit(page, query):
             return IN_PROGRESS, "", ""
-        if not await _wait_for_navigation(page):
+        navigated = await _wait_for_navigation(page, start_url)
+
+        try:
+            cur_url = page.url or ""
+        except Exception:
+            cur_url = ""
+
+        # Bounce: post-submit URL is back at the homepage. This catches
+        # both forms — full redirect from a previous result back to '/',
+        # and same-page re-render on the homepage (which leaves URL='/').
+        if cur_url and _BIDFAX_HOME_PATH.match(cur_url):
+            try:
+                bounce_html = await page.get_content()
+            except Exception:
+                bounce_html = ""
+            _dump_empty_search(query, bounce_html)
+            raise _BidfaxBounce(query)
+
+        if not navigated:
+            # Didn't navigate AND not at home — silent rejection, can't
+            # make progress. Bail without a screenshot dump (rare).
             return IN_PROGRESS, "", ""
 
         polls_after_cf = 0
@@ -644,20 +704,14 @@ async def _search_once(page, query: str) -> tuple[str, str, str]:
             result = extract_grid_result(last_html)
             if result is not None:
                 return result
-            # Page came back as the homepage → server rejected the submission.
-            # Save a snapshot then signal the caller; transient bounces are
-            # often rescued by a fresh page navigation + fresh reCAPTCHA token.
-            if _HOMEPAGE_MARKER in last_html:
-                _dump_empty_search(query, last_html)
-                raise _BidfaxBounce(query)
             polls_after_cf += 1
             if polls_after_cf >= _GRID_POLL_BUDGET:
                 break
 
         # Search reached this point with CF cleared but no grid result —
         # most likely bidfax has nothing for `query`, but it could also be a
-        # page-shape change (different result-URL pattern, missing #grid). Dump
-        # a snippet so the next failure is debuggable instead of silent.
+        # page-shape change (different result-URL pattern, missing #grid).
+        # Dump a snippet so the next failure is debuggable instead of silent.
         _dump_empty_search(query, last_html)
         return IN_PROGRESS, "", ""
     finally:
@@ -682,7 +736,8 @@ _MISMATCH_MAX_ATTEMPTS  = 3
 
 
 async def _query_with_retries(page, query: str, expected_make: str) -> tuple[str, str, str]:
-    """Run one bidfax search; retry on two specific failure modes.
+    """Run one bidfax search on the supplied page; retry on two specific
+    failure modes.
 
       * Homepage bounce — the server rejected our submission (low reCAPTCHA
         score, rate-limit, or bidfax simply doesn't have this lot). One
@@ -694,13 +749,17 @@ async def _query_with_retries(page, query: str, expected_make: str) -> tuple[str
 
     A genuine empty-grid "no result" (URL absent but not a bounce) returns
     immediately — bidfax simply doesn't index that lot yet.
+
+    The page is NOT reloaded here. Caller is expected to have already
+    landed it on bidfax (homepage on first call; previous result page on
+    subsequent calls — bidfax's search form lives on result pages too, so
+    we reuse it). `_fill_and_submit` clears stale form state before each
+    submission; the per-iteration `await page.get(BIDFAX_HOME)` of older
+    versions is gone (saves a full reload + Cloudflare wait per lot).
     """
     bounce_attempts   = 0
     mismatch_attempts = 0
     while True:
-        await page.get(BIDFAX_HOME)
-        await asyncio.sleep(2)
-        await _wait_cf_clear(page)
         try:
             price, vin, url = await _search_once(page, query)
         except _BidfaxBounce:
