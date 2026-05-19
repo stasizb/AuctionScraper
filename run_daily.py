@@ -389,17 +389,20 @@ def _print_timing_section() -> None:
               f"{_format_duration(secs)}  ·  {cars} cars  ·  {per_car}")
 
 
-def _phase_search(py, s, o, bp,
-                  output:         Path,
-                  filters:        Path,
-                  chrome_profile: Path,
-                  today:          str,
-                  copart_date:    str | None) -> None:
+def _phase_search(py, s, o,
+                  output:      Path,
+                  filters:     Path,
+                  today:       str,
+                  copart_date: str | None) -> None:
     """Phase 1: parallel chains.
       Chain A: copart_search → remove_duplicates  (HTTP, then file I/O)
-      Chain B: iaai_search                        (browser-bound, long pole)
+      Chain B: iaai_search                        (its own Playwright)
     Step 3 only depends on chain A's output, so it chains directly behind
-    copart_search rather than waiting for the slower IAAI scrape."""
+    copart_search rather than waiting for IAAI.
+
+    The shared-Chrome args (--browser-port, --profile-dir) of older
+    versions are intentionally absent: every script in this phase owns
+    its own browser via clients/{copart,iaai}_session.py."""
     chain_copart: list[tuple[str, list[str]]] = [
         (STEP_COPART_SEARCH, [
             py, s("copart_search.py"),
@@ -419,12 +422,14 @@ def _phase_search(py, s, o, bp,
 
     run_parallel_chains([
         chain_copart,
+        # iaai_search.py used to need --browser-port + --profile-dir
+        # (legacy nodriver path); the API-route SessionIAAIClient owns
+        # its own Playwright warmup via clients.iaai_session, so we
+        # don't hand off the shared Chrome here.
         [(STEP_IAAI_SEARCH, [
             py, s("iaai_search.py"),
-            "--input",       str(filters / "iaai_filters.csv"),
-            "--output",      o(f"iaai_search_{today}.csv"),
-            "--profile-dir", str(chrome_profile),
-            *bp,
+            "--input",  str(filters / "iaai_filters.csv"),
+            "--output", o(f"iaai_search_{today}.csv"),
         ])],
     ])
 
@@ -532,8 +537,7 @@ def main() -> None:
         skip_reason = f"--from-step={args.from_step}"
 
         if from_phase <= PHASE_SEARCH:
-            _phase_search(py, s, o, bp, output, filters, chrome_profile,
-                          today, copart_date)
+            _phase_search(py, s, o, output, filters, today, copart_date)
         else:
             skip(STEP_COPART_SEARCH,     skip_reason)
             skip(STEP_IAAI_SEARCH,       skip_reason)
