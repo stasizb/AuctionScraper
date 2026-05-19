@@ -5,6 +5,7 @@ import unittest
 from tests._helpers import ROOT  # noqa: F401
 
 from clients.iaai import (
+    AUCTION_DATE_COL,
     DEFAULT_TAB_CONCURRENCY,
     FakeIAAIClient, OUTPUT_FIELDS,
     _parse_scraped_row,
@@ -161,43 +162,225 @@ class TestFakeIAAIClient(unittest.TestCase):
                          c.scrape_many([{"make": "HONDA"}]))
 
 
-class TestBrowserClientConcurrencyConfig(unittest.TestCase):
-    """BrowserIAAIClient should read tab_concurrency from its constructor and
-    expose a sensible default for the CLI / orchestrator to pick up."""
+class TestConcurrencyConstantStillExported(unittest.TestCase):
+    """The DEFAULT_TAB_CONCURRENCY re-export from clients.iaai survives the
+    Browser → Session refactor. The new SessionIAAIClient doesn't drive
+    parallel tabs itself (the daily run is a single POST per filter row),
+    but other importers still expect the constant on this module."""
 
     def test_default_constant_is_positive(self):
-        # The actual value comes from core.concurrency (env-driven); we only
-        # care here that iaai.py re-exports a usable int. Per-value checks
-        # live in test_concurrency.py.
         self.assertIsInstance(DEFAULT_TAB_CONCURRENCY, int)
         self.assertGreaterEqual(DEFAULT_TAB_CONCURRENCY, 1)
 
-    def test_explicit_value_overrides_default(self):
-        # We can't import BrowserIAAIClient unconditionally — it requires the
-        # `nodriver` package — so guard the import.
-        try:
-            from clients.iaai import BrowserIAAIClient
-        except RuntimeError:
-            self.skipTest("nodriver not installed")
-        c = BrowserIAAIClient(tab_concurrency=5)
-        self.assertEqual(c._tab_concurrency, 5)
 
-    def test_none_falls_back_to_default(self):
-        try:
-            from clients.iaai import BrowserIAAIClient
-        except RuntimeError:
-            self.skipTest("nodriver not installed")
-        c = BrowserIAAIClient()
-        self.assertEqual(c._tab_concurrency, DEFAULT_TAB_CONCURRENCY)
+class TestBuildSearchPayload(unittest.TestCase):
+    """Pure payload-builder for the IAAI /Search API. Validates the
+    canonical Facet/LongRange shapes we discovered via live probing."""
 
-    def test_zero_or_negative_clamped_to_one(self):
-        # Defensive: a misconfigured CLI flag of 0 would deadlock the semaphore.
-        try:
-            from clients.iaai import BrowserIAAIClient
-        except RuntimeError:
-            self.skipTest("nodriver not installed")
-        self.assertEqual(BrowserIAAIClient(tab_concurrency=0)._tab_concurrency,  1)
-        self.assertEqual(BrowserIAAIClient(tab_concurrency=-3)._tab_concurrency, 1)
+    def _searches(self, payload):
+        return payload["Searches"]
+
+    def test_baseline_always_applied(self):
+        from clients.iaai import build_search_payload
+        # Even with no filters, the baseline 4 Search blocks must be present:
+        # Default=True, AuctionDate=AuctionToday, ODOValue range, Run & Drive.
+        p = build_search_payload({})
+        groups = [s["Facets"][0]["Group"]
+                  for s in self._searches(p) if s.get("Facets")]
+        self.assertIn("Default",     groups)
+        self.assertIn("AuctionDate", groups)
+        self.assertIn("StartsDesc",  groups)
+        # ODOValue is a LongRange, not a Facet — check it separately.
+        long_ranges = [lr for s in self._searches(p)
+                       for lr in (s.get("LongRanges") or [])]
+        self.assertTrue(any(lr.get("Name") == "ODOValue" for lr in long_ranges))
+
+    def test_make_becomes_facet_model_does_not(self):
+        # Make IS sent as a Facet; Model is NOT (it's post-filtered in
+        # Python — see build_search_payload's docstring for why). This
+        # guards against accidentally re-adding the strict-Model facet
+        # that was empirically observed to miss sub-trims (e.g. the
+        # API's Model="CR-V HYBRID" doesn't include AWD SPORT TOURING).
+        from clients.iaai import build_search_payload
+        p = build_search_payload({"make": "Honda", "models": ["CR-V", "Pilot"]})
+        make = next((s for s in self._searches(p)
+                     if s.get("Facets") and s["Facets"][0]["Group"] == "Make"), None)
+        self.assertIsNotNone(make)
+        self.assertEqual(make["Facets"][0]["Value"], "HONDA")
+        # No Search block should carry a Model facet.
+        for s in self._searches(p):
+            for f in (s.get("Facets") or []):
+                self.assertNotEqual(f.get("Group"), "Model",
+                    "Model must be filtered in Python, not as an API facet")
+
+    def test_year_range_expands_to_per_year_facets(self):
+        from clients.iaai import build_search_payload
+        p = build_search_payload({"year_min": 2023, "year_max": 2025})
+        year = next((s for s in self._searches(p)
+                     if s.get("Facets")
+                     and s["Facets"][0]["Group"] == "Year"), None)
+        self.assertIsNotNone(year)
+        self.assertEqual([f["Value"] for f in year["Facets"]],
+                         ["2023", "2024", "2025"])
+
+    def test_fuel_type_canonicalized(self):
+        from clients.iaai import build_search_payload
+        # CSV says "Gas" → API expects "Gasoline".
+        p = build_search_payload({"fuel_type": "Gas"})
+        fuel = next((s for s in self._searches(p)
+                     if s.get("Facets")
+                     and s["Facets"][0]["Group"] == "FuelTypeDesc"), None)
+        self.assertIsNotNone(fuel)
+        self.assertEqual(fuel["Facets"][0]["Value"], "Gasoline")
+        # CSV "Hybrid Engine" also maps to "Hybrid".
+        p = build_search_payload({"fuel_type": "Hybrid Engine"})
+        fuel = next((s for s in self._searches(p)
+                     if s.get("Facets")
+                     and s["Facets"][0]["Group"] == "FuelTypeDesc"), None)
+        self.assertEqual(fuel["Facets"][0]["Value"], "Hybrid")
+
+    def test_odometer_max_overrides_baseline_default(self):
+        from clients.iaai import build_search_payload
+        p = build_search_payload({"odometer_max": 50000})
+        lr = next((lr for s in self._searches(p)
+                   for lr in (s.get("LongRanges") or [])
+                   if lr.get("Name") == "ODOValue"), None)
+        self.assertEqual(lr["To"], 50000)
+
+    def test_no_filters_omits_optional_blocks(self):
+        # Without make/models/year/fuel, only the 4 baseline blocks are sent.
+        from clients.iaai import build_search_payload
+        p = build_search_payload({})
+        self.assertEqual(len(p["Searches"]), 4)
+
+    def test_top_level_envelope(self):
+        from clients.iaai import build_search_payload, PAGE_SIZE
+        p = build_search_payload({})
+        self.assertEqual(p["PageSize"],   PAGE_SIZE)
+        self.assertEqual(p["CurrentPage"], 1)
+        # SaleStatus / BidStatus filters intentionally empty — see the
+        # comment in build_search_payload for why.
+        self.assertEqual(p["SaleStatusFilters"], [])
+        self.assertEqual(p["BidStatusFilters"],  [])
+
+
+class TestApplyModelPostfilter(unittest.TestCase):
+    """`apply_model_postfilter` keeps rows whose `_full_title` contains
+    every token of any listed model. This replaces the IAAI Model facet
+    (which only matches leaf sub-trims, not the user's parent name)."""
+
+    def test_no_models_is_noop(self):
+        from clients.iaai import apply_model_postfilter
+        rows = [{"_full_title": "2025 HONDA HR-V"},
+                {"_full_title": "2024 TOYOTA RAV4"}]
+        self.assertEqual(apply_model_postfilter(rows, []),  rows)
+
+    def test_single_model_substring_match(self):
+        from clients.iaai import apply_model_postfilter
+        rows = [
+            {"_full_title": "2025 HONDA CR-V HYBRID AWD SPORT TOURING"},
+            {"_full_title": "2025 HONDA HR-V AWD LX"},
+            {"_full_title": "2024 HONDA CIVIC HYBRID SPORT"},
+        ]
+        # "CR-V HYBRID" keeps the Touring CR-V and the Civic Hybrid is
+        # dropped (missing "CR-V"), HR-V also dropped (missing "HYBRID").
+        kept = apply_model_postfilter(rows, ["CR-V HYBRID"])
+        self.assertEqual([r["_full_title"] for r in kept],
+                         ["2025 HONDA CR-V HYBRID AWD SPORT TOURING"])
+
+    def test_multiple_models_any_of(self):
+        # CSV "Model: GLE 350; GLB 250" → keep any row matching GLE+350
+        # OR GLB+250 (in any order).
+        from clients.iaai import apply_model_postfilter
+        rows = [
+            {"_full_title": "2024 MERCEDES-BENZ GLE 350 4MATIC"},
+            {"_full_title": "2023 MERCEDES-BENZ GLB 250 4MATIC"},
+            {"_full_title": "2024 MERCEDES-BENZ GLC 300"},
+        ]
+        kept = apply_model_postfilter(rows, ["GLE 350", "GLB 250"])
+        self.assertEqual({r["_full_title"] for r in kept},
+                         {"2024 MERCEDES-BENZ GLE 350 4MATIC",
+                          "2023 MERCEDES-BENZ GLB 250 4MATIC"})
+
+    def test_case_insensitive(self):
+        from clients.iaai import apply_model_postfilter
+        rows = [{"_full_title": "2025 mazda cx-5 turbo signature"}]
+        kept = apply_model_postfilter(rows, ["CX-5"])
+        self.assertEqual(len(kept), 1)
+
+    def test_token_order_insensitive(self):
+        # "Premium Plus 45" should match a title with those words in any
+        # order — same semantics as equipment_matches.
+        from clients.iaai import apply_model_postfilter
+        rows = [{"_full_title": "2024 AUDI Q5 PREMIUM PLUS 45 TFSI"},
+                {"_full_title": "2024 AUDI Q5 45 PREMIUM PLUS TFSI"},
+                {"_full_title": "2024 AUDI Q5 PREMIUM 40 TFSI"}]
+        kept = apply_model_postfilter(rows, ["Premium Plus 45"])
+        self.assertEqual({r["_full_title"] for r in kept},
+                         {"2024 AUDI Q5 PREMIUM PLUS 45 TFSI",
+                          "2024 AUDI Q5 45 PREMIUM PLUS TFSI"})
+
+    def test_missing_title_drops_row(self):
+        from clients.iaai import apply_model_postfilter
+        rows = [{"_full_title": ""}, {}]
+        self.assertEqual(apply_model_postfilter(rows, ["CR-V"]), [])
+
+
+class TestParseSearchHtml(unittest.TestCase):
+    """`parse_search_html` extracts vehicle rows from server-rendered
+    /Search HTML. Empty-result responses (no real rows) yield []."""
+
+    _ROW = """
+    <div class="table-row table-row-border">
+      <div class="table-cell--heading">
+        <a href="/VehicleDetail/123">2024 HONDA CR-V EX</a>
+      </div>
+      <span title="Stock #">98765432</span>
+      <span title="Primary Damage">Front End</span>
+      <span title="Odometer">12,345 mi</span>
+      <span title="Fuel Type">Gasoline</span>
+      <span title="ACV: $30,000 USD">$30,000 USD</span>
+      <div class="data-list--data">
+        <a aria-label="Branch Name">Chicago South (Illinois)</a>
+      </div>
+      <span class="data-list__value--action">Tue May 19, 8:30am CDT</span>
+    </div>
+    """
+
+    def test_parses_one_row_into_canonical_dict(self):
+        from clients.iaai import parse_search_html
+        rows = parse_search_html(f"<html><body>{self._ROW}</body></html>")
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["Lot Number"],     "98765432")
+        self.assertEqual(r["Primary Damage"], "Front End")
+        self.assertEqual(r["Year"],           "2024")
+        self.assertEqual(r["Make"],           "HONDA")
+        self.assertIn("CR-V",                 r["Model"])
+        self.assertEqual(r["Location"],       "Chicago South (Illinois)")
+        self.assertIn("/VehicleDetail/123",   r["Link"])
+        # Auction date got canonicalised via normalize_auction_date.
+        self.assertIn("UTC", r[AUCTION_DATE_COL])
+
+    def test_empty_result_returns_empty_list(self):
+        # IAAI's empty-result placeholder is a .table-row.table-row-border
+        # WITHOUT a heading-link href — `_parse_scraped_row` drops rows
+        # missing a Link, so the empty case naturally returns [].
+        from clients.iaai import parse_search_html
+        empty_placeholder = """
+        <div class="table-row table-row-border">
+          <div class="table-cell--heading">
+            <!-- no <a href> here -->
+            <span>No results</span>
+          </div>
+        </div>
+        """
+        rows = parse_search_html(f"<html><body>{empty_placeholder}</body></html>")
+        self.assertEqual(rows, [])
+
+    def test_no_rows_at_all_returns_empty_list(self):
+        from clients.iaai import parse_search_html
+        self.assertEqual(parse_search_html("<html><body></body></html>"), [])
 
 
 if __name__ == "__main__":

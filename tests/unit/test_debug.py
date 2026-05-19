@@ -92,29 +92,10 @@ class TestScreenshotHelpersGated(unittest.TestCase):
     """Both screenshot helpers must short-circuit when the flag is False —
     no save_screenshot call, no logs/ touch, no print line."""
 
-    def test_iaai_helper_noops_when_flag_false(self):
-        from clients import iaai
-
-        calls = {"shots": 0}
-        class FakePage:
-            async def save_screenshot(self, *a, **kw):
-                calls["shots"] += 1
-
-        with patch.object(iaai, "DEBUG_SCREENSHOTS", False):
-            asyncio.run(iaai._save_search_screenshot(FakePage(), 0, "HONDA"))
-        self.assertEqual(calls["shots"], 0)
-
-    def test_iaai_helper_fires_when_flag_true(self):
-        from clients import iaai
-
-        calls = {"shots": 0}
-        class FakePage:
-            async def save_screenshot(self, *a, **kw):
-                calls["shots"] += 1
-
-        with patch.object(iaai, "DEBUG_SCREENSHOTS", True):
-            asyncio.run(iaai._save_search_screenshot(FakePage(), 0, "HONDA"))
-        self.assertEqual(calls["shots"], 1)
+    # IAAI helper tests (_save_search_screenshot) were removed alongside the
+    # nodriver-driven BrowserIAAIClient — the new SessionIAAIClient does
+    # not render pages in a browser and so has no screenshots to gate. The
+    # equivalent bidfax helper still exists and is tested below.
 
     def test_bidfax_helper_noops_when_flag_false(self):
         from clients import bidfax

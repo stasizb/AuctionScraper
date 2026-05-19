@@ -1,0 +1,767 @@
+#!/usr/bin/env python3
+"""
+IAAIClient abstraction — wraps all browser interaction with iaai.com.
+
+  - IAAIClient         — the interface scripts depend on
+  - BrowserIAAIClient  — real implementation using nodriver
+  - FakeIAAIClient     — test double that returns canned row lists
+
+Filter parsing (read_filters_csv / parse_filter_row) and the equipment
+post-filter (equipment_matches) are pure helpers also exposed from this
+module so the CLI wrapper stays thin.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import csv
+import json
+import re
+import socket
+import sys
+from pathlib import Path
+from typing import Callable, Protocol, runtime_checkable
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core.chrome      import find_chrome
+from core.dates       import normalize_auction_date
+from core.debug       import DEBUG_SCREENSHOTS
+from core.concurrency import (  # noqa: F401  (re-exported)
+    DEFAULT_TAB_CONCURRENCY,
+    IAAI_TAB_CONCURRENCY,
+)
+from core.job_log     import job_log
+
+try:
+    import nodriver as uc
+    _NODRIVER_OK = True
+except ImportError:
+    _NODRIVER_OK = False
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+IAAI_SEARCH_URL = "https://www.iaai.com/Search"
+
+# AUCTION_DATE_COL is sourced from core.columns (re-exported below for
+# back-compat with code that still does `from clients.iaai import AUCTION_DATE_COL`).
+from core.columns import AUCTION_DATE_COL  # noqa: E402,F401
+
+OUTPUT_FIELDS = [
+    "Make", "Model", "Year", "Odometer", "Fuel Type",
+    "Lot Number", "Link", AUCTION_DATE_COL, "Location",
+    "Primary Damage", "ACV",
+]
+
+WAIT_SHORT  = 1.5
+WAIT_MEDIUM = 3.0
+WAIT_LONG   = 5.0
+
+# We bake "Run & Drive" + "Auction Today" + Odometer max into a single
+# warmup URL at the start of every run, then point all per-row tabs at it.
+# This saves 3 click-and-wait cycles per tab and gives IAAI's URL encoding
+# (rather than session state) authority over the starting filters.
+_BAKED_ODO_MAX = 30000
+
+# IAAI_TAB_CONCURRENCY is re-exported from core.concurrency. It controls how
+# many filter rows scrape in parallel tabs; raising it speeds things up but
+# risks IAAI throttling. Set via the IAAI_TAB_CONCURRENCY env var (or, if
+# unset, falls back to the shared DEFAULT_TAB_CONCURRENCY).
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers (no browser)
+# ---------------------------------------------------------------------------
+
+# Filter parsing + equipment post-filter live in clients.iaai_filters so this
+# module isn't 800+ lines of mixed concerns. Re-exported here so existing
+# `from clients.iaai import parse_filter_row` etc. keep working.
+from clients.iaai_filters import (   # noqa: E402
+    _apply_segment,
+    _reassemble_segments,
+    apply_equipment_postfilter,
+    equipment_matches,
+    parse_filter_row,
+    read_filters_csv,
+)
+
+
+def write_output_csv(path: str, records: list[dict]) -> None:
+    from core.csv_io import save_csv_dict
+    save_csv_dict(Path(path), OUTPUT_FIELDS, records)
+    print(f"[+] Saved {len(records)} record(s) -> {path}")
+
+
+def _unwrap_evaluate_result(raw):
+    for _ in range(5):
+        if isinstance(raw, str):
+            return raw
+        if isinstance(raw, dict) and "value" in raw:
+            raw = raw["value"]
+        else:
+            break
+    return raw
+
+
+def _parse_scraped_row(r: dict) -> dict | None:
+    if not isinstance(r, dict):
+        return None
+    record = dict.fromkeys(OUTPUT_FIELDS, "")
+    record.update({k: v for k, v in r.items() if k in OUTPUT_FIELDS})
+    for field in ("Year", "Make", "Model"):
+        if not record[field]:
+            record[field] = r.get(field, "")
+    # Normalize IAAI's local-time dates to the canonical UTC form so every
+    # consumer (price CSVs, workbook, HTML) sees the same shape.
+    if record.get(AUCTION_DATE_COL):
+        record[AUCTION_DATE_COL] = normalize_auction_date(record[AUCTION_DATE_COL])
+    record["_full_title"] = r.get("_full_title", "")
+    return record if record.get("Link") else None
+
+
+# ---------------------------------------------------------------------------
+# Protocol
+# ---------------------------------------------------------------------------
+
+@runtime_checkable
+class IAAIClient(Protocol):
+    """Everything scripts need from iaai.com. The main entry is `scrape_many`
+    — it owns the full browser lifecycle so every query runs under the same
+    asyncio event loop (nodriver objects can't cross loops)."""
+
+    def scrape_many(self, filter_rows: list[dict]) -> list[dict]:
+        """Open browser once, apply each filter set in turn, return all rows."""
+
+    # Kept for ad-hoc single-filter use (tests, REPL). Defaults to scrape_many.
+    def scrape_with_filters(self, filters: dict, clear_filters: bool = False) -> list[dict]:
+        return self.scrape_many([filters])
+
+
+# ---------------------------------------------------------------------------
+# Real (browser-backed) implementation
+# ---------------------------------------------------------------------------
+
+class BrowserIAAIClient:
+    """Live iaai.com client backed by a real Chrome session (via nodriver).
+
+    Every public method manages its own browser lifecycle inside a single
+    asyncio.run() — nodriver objects are loop-scoped, so reusing them
+    across asyncio.run invocations would crash (see BrowserBidfaxClient
+    for the same pattern)."""
+
+    def __init__(
+        self,
+        browser_port: int | None = None,
+        profile_dir: str | None = None,
+        tab_concurrency: int | None = None,
+    ) -> None:
+        if not _NODRIVER_OK:
+            raise RuntimeError("nodriver is required. Install with:  pip install nodriver")
+        self._browser_port = browser_port
+        self._profile_dir  = profile_dir
+        if tab_concurrency is None:
+            tab_concurrency = IAAI_TAB_CONCURRENCY
+        self._tab_concurrency = max(1, tab_concurrency)
+
+    # ---- Public interface --------------------------------------------------
+
+    def scrape_many(self, filter_rows: list[dict]) -> list[dict]:
+        if not filter_rows:
+            return []
+        return asyncio.run(self._scrape_many_async(filter_rows))
+
+    def scrape_with_filters(self, filters: dict, clear_filters: bool = False) -> list[dict]:
+        del clear_filters  # scrape_many handles clearing between filter sets
+        return self.scrape_many([filters])
+
+    # ---- Async internals ---------------------------------------------------
+
+    async def _start_browser(self):
+        """Start Chrome (or attach). Returns (browser, chrome_proc | None)."""
+        if self._browser_port:
+            print(f"[iaai] attaching to shared Chrome on port {self._browser_port}…",
+                  flush=True)
+            browser = await asyncio.wait_for(
+                uc.start(host="127.0.0.1", port=self._browser_port),
+                timeout=30.0,
+            )
+            print("[iaai] nodriver attached.", flush=True)
+            return browser, None
+        port = _free_port()
+        print(f"[iaai] launching Chrome on port {port} (profile={self._profile_dir})…",
+              flush=True)
+        chrome_proc = await _start_chrome(
+            port, self._profile_dir or "caches/chrome_profile_iaai",
+        )
+        browser = await asyncio.wait_for(
+            uc.start(host="127.0.0.1", port=port), timeout=30.0,
+        )
+        print("[iaai] Chrome + nodriver ready.", flush=True)
+        return browser, chrome_proc
+
+    async def _stop_browser(self, browser, chrome_proc) -> None:
+        if chrome_proc is None:
+            return
+        try:
+            await asyncio.wait_for(browser.stop(), timeout=5.0)
+        except Exception:
+            pass
+        chrome_proc.terminate()
+
+    async def _resolve_base_url(self, browser) -> str:
+        """Open /Search, apply Run & Drive + Auction Today + Odometer 30000,
+        and return the resulting filter-encoded URL.
+
+        Falls back to the plain /Search URL if anything fails — workers will
+        then apply the baked-in filters per-tab (slower but correct).
+        """
+        print("[iaai] resolving base URL with Run&Drive + Auction Today + "
+              f"Odo<={_BAKED_ODO_MAX} baked in...", flush=True)
+        page = None
+        try:
+            page = await asyncio.wait_for(
+                browser.get(IAAI_SEARCH_URL, new_tab=True), timeout=30.0,
+            )
+            await asyncio.sleep(WAIT_LONG)
+            await _clear_all_filters(page)
+            await _apply_featured_filter(page, "Run & Drive")
+            await _apply_featured_filter(page, "Auction Today")
+            await _apply_odometer_filter(page, _BAKED_ODO_MAX)
+            await asyncio.sleep(WAIT_MEDIUM)
+            url = await page.evaluate("window.location.href")
+            if not isinstance(url, str) or "?url=" not in url:
+                # IAAI didn't encode the filters into the URL — bail to
+                # the per-tab fallback path so we don't lose the bakes.
+                print(f"[iaai] [warn] base URL has no filter encoding "
+                      f"({url!r}); falling back to /Search per-tab",
+                      flush=True)
+                return IAAI_SEARCH_URL
+            print(f"[iaai] base URL: {url}", flush=True)
+            return url
+        except Exception as exc:
+            print(f"[iaai] [warn] base URL resolution failed: {exc} "
+                  f"— using /Search per-tab", flush=True)
+            return IAAI_SEARCH_URL
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+    async def _scrape_many_async(self, filter_rows: list[dict]) -> list[dict]:
+        concurrency = min(self._tab_concurrency, len(filter_rows))
+        total       = len(filter_rows)
+        print(f"[iaai] scrape_many: {total} filter set(s), "
+              f"tab_concurrency={concurrency}", flush=True)
+        browser, chrome_proc = await self._start_browser()
+        try:
+            base_url = await self._resolve_base_url(browser)
+            sem     = asyncio.Semaphore(concurrency)
+            results: list[list[dict]] = [[] for _ in filter_rows]
+
+            async def _worker(idx: int, filters: dict) -> None:
+                async with sem, job_log():
+                    print(f"\n[*] Filter set {idx + 1}/{total} — opening tab", flush=True)
+                    tab = None
+                    try:
+                        tab = await asyncio.wait_for(
+                            browser.get(base_url, new_tab=True), timeout=30.0,
+                        )
+                        await asyncio.sleep(WAIT_LONG)
+                        results[idx] = await self._scrape_one(
+                            tab, filters, row_idx=idx, base_url=base_url,
+                        )
+                    except Exception as exc:
+                        print(f"[!] Error on filter set {idx + 1}: {exc}", flush=True)
+                        import traceback
+                        traceback.print_exc()
+                        await asyncio.sleep(3)
+                    finally:
+                        if tab is not None:
+                            try:
+                                await tab.close()
+                            except Exception:
+                                pass
+
+            await asyncio.gather(*(_worker(i, f) for i, f in enumerate(filter_rows)))
+            return [row for sub in results for row in sub]
+        finally:
+            await self._stop_browser(browser, chrome_proc)
+
+    async def _scrape_one(self, page, filters: dict,
+                          row_idx: int = 0,
+                          base_url: str = IAAI_SEARCH_URL) -> list[dict]:
+        # The caller already navigated to base_url before calling us, but
+        # re-navigate as a no-op safety measure if base_url differs from
+        # the page's current URL (e.g. legacy callers / tests).
+        await page.get(base_url)
+        await asyncio.sleep(WAIT_LONG)
+
+        # base_url either contains an encoded filter state ("...?url=ENCODED")
+        # with Run & Drive + Auction Today + Odometer baked in, or it's the
+        # plain /Search fallback — in which case we apply those filters here.
+        is_pre_filtered = base_url != IAAI_SEARCH_URL
+
+        if not is_pre_filtered:
+            await _clear_all_filters(page)
+
+        make      = str(filters.get("make", "")).strip()
+        models    = [str(m).strip() for m in (filters.get("models") or []) if str(m).strip()]
+        year_min  = filters.get("year_min")
+        year_max  = filters.get("year_max")
+        # Per-row odometer is intentionally ignored: the base URL bakes in
+        # Odometer max 30000 for everyone (see _BAKED_ODO_MAX). Future work:
+        # support per-row odometer override, see TODO.md.
+        row_odo   = filters.get("odometer_max")
+        fuel_type = str(filters.get("fuel_type", "")).strip()
+        equipment = str(filters.get("equipment", "")).strip()
+
+        odo_note = f"Odo<={_BAKED_ODO_MAX} (baked-in URL)"
+        if row_odo is not None and row_odo != _BAKED_ODO_MAX:
+            odo_note += f" — row odometer_max={row_odo} ignored"
+        print(f"[iaai] Filters -> Make={make!r}, Models={models}, "
+              f"Year={year_min}-{year_max}, {odo_note}, "
+              f"Fuel={fuel_type!r}, Equipment={equipment!r}", flush=True)
+
+        if not is_pre_filtered:
+            await _apply_featured_filter(page, "Run & Drive")
+            await _apply_featured_filter(page, "Auction Today")
+        await _apply_year_filter(page, year_min, year_max)
+        if not await _apply_make_filter(page, make):
+            # Make not in today's filter panel — IAAI has no lots of this
+            # make today, so model/fuel checks would all fail. Skip to save time.
+            print("    [iaai] [!] Skipping scrape — make not in today's list.",
+                  flush=True)
+            return []
+        if not await _apply_model_filters(page, models):
+            return []
+        await _apply_fuel_type_filter(page, fuel_type)
+        if not is_pre_filtered:
+            await _apply_odometer_filter(page, _BAKED_ODO_MAX)
+        await asyncio.sleep(WAIT_MEDIUM)
+
+        # Snapshot the filtered results page for later debugging (e.g. when
+        # a filter mysteriously returns nothing) — see also TODO.md.
+        await _save_search_screenshot(page, row_idx, make)
+
+        all_records: list[dict] = []
+        page_num    = 1
+        total_pages = await _get_total_pages(page)
+        print(f"    [iaai] Total pages detected: {total_pages}", flush=True)
+        while True:
+            print(f"    [iaai] Scraping page {page_num}/{total_pages} …", flush=True)
+            page_records = await _scrape_current_page(page)
+            all_records.extend(apply_equipment_postfilter(page_records, equipment))
+            if page_num >= total_pages:
+                break
+            if not await _go_to_next_page(page):
+                break
+            page_num += 1
+        print(f"    [iaai] Kept for this filter set: {len(all_records)}", flush=True)
+        return all_records
+
+
+# ---------------------------------------------------------------------------
+# Fake (in-memory) implementation for tests
+# ---------------------------------------------------------------------------
+
+class FakeIAAIClient:
+    """In-memory IAAIClient.
+
+    Two modes:
+      - flat:      FakeIAAIClient(rows=[...])                returns same list every call
+      - callable:  FakeIAAIClient(scrape_fn=lambda f: ...)   compute per-filter result
+    """
+
+    def __init__(
+        self,
+        rows: list[dict] | None = None,
+        scrape_fn: Callable[[dict], list[dict]] | None = None,
+    ) -> None:
+        self._rows      = list(rows or [])
+        self._scrape_fn = scrape_fn
+        self.calls: list[dict] = []
+
+    def scrape_many(self, filter_rows: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for filters in filter_rows:
+            out.extend(self._scrape_one(filters))
+        return out
+
+    def scrape_with_filters(self, filters: dict, clear_filters: bool = False) -> list[dict]:
+        del clear_filters  # fake has no UI state
+        return self._scrape_one(filters)
+
+    def _scrape_one(self, filters: dict) -> list[dict]:
+        self.calls.append(dict(filters))
+        if self._scrape_fn is not None:
+            return list(self._scrape_fn(filters))
+        return list(self._rows)
+
+
+# ---------------------------------------------------------------------------
+# Browser startup (private)
+# ---------------------------------------------------------------------------
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _cdp_ready(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+async def _start_chrome(port: int, profile_dir: str) -> asyncio.subprocess.Process:
+    Path(profile_dir).mkdir(parents=True, exist_ok=True)
+    chrome_exe = find_chrome()
+    proc = await asyncio.create_subprocess_exec(
+        chrome_exe,
+        f"--remote-debugging-port={port}",
+        "--remote-debugging-host=127.0.0.1",
+        "--no-first-run",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-session-crashed-bubble",
+        "--window-size=1400,900",
+        f"--user-data-dir={profile_dir}",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        async with asyncio.timeout(15.0):
+            while not _cdp_ready("127.0.0.1", port):
+                await asyncio.sleep(0.3)
+    except TimeoutError:
+        proc.terminate()
+        raise RuntimeError(f"Chrome did not expose CDP on port {port} within 15s")
+    return proc
+
+
+# ---------------------------------------------------------------------------
+# Page interaction helpers (private)
+# ---------------------------------------------------------------------------
+
+_LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
+
+
+async def _save_search_screenshot(page, row_idx: int, make: str) -> None:
+    """Snap the current viewport after filters are applied.
+
+    Filename: logs/iaai_search_screenshot_<YYYY_MM_DD>_<row>_<MAKE>.png
+    Errors are swallowed — a failed screenshot must never break the scrape.
+    Gated on `DEBUG_SCREENSHOTS` (env / .env): off by default to keep
+    routine runs fast and disk-light.
+    """
+    if not DEBUG_SCREENSHOTS:
+        return
+    from datetime import date
+    safe_make = re.sub(r"[^A-Za-z0-9-]+", "_", make.upper()) or "UNKNOWN"
+    name      = (
+        f"iaai_search_screenshot_{date.today():%Y_%m_%d}"
+        f"_{row_idx + 1:02d}_{safe_make}.png"
+    )
+    path = _LOGS_DIR / name
+    try:
+        _LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        await page.save_screenshot(filename=str(path), format="png", full_page=True)
+        print(f"    [iaai] screenshot saved → {path}", flush=True)
+    except Exception as exc:
+        print(f"    [iaai] [warn] screenshot failed: {exc}", flush=True)
+
+
+async def _clear_all_filters(page) -> bool:
+    js = """
+    (function() {
+        var link = document.querySelector('a.link[data-bind*="ClearFilters"]');
+        if (link) { link.click(); return true; }
+        var links = document.querySelectorAll('a.link');
+        for (var l of links) {
+            if (l.innerText.trim().toLowerCase() === 'clear all filters') {
+                l.click();
+                return true;
+            }
+        }
+        return false;
+    })();
+    """
+    ok = await page.evaluate(js)
+    if ok:
+        print("    [iaai] Cleared all previous filters", flush=True)
+        await asyncio.sleep(WAIT_MEDIUM * 1.5)
+    else:
+        print("    [iaai] No active filters to clear", flush=True)
+    return bool(ok)
+
+
+async def _set_input_value(page, element_id: str, value: str) -> bool:
+    js = f"""
+    (function() {{
+        var el = document.getElementById('{element_id}');
+        if (!el) return false;
+        var setter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value').set;
+        setter.call(el, '{value}');
+        el.dispatchEvent(new Event('input',  {{bubbles: true}}));
+        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+        el.dispatchEvent(new KeyboardEvent('keyup', {{bubbles: true}}));
+        return true;
+    }})();
+    """
+    return await page.evaluate(js)
+
+
+async def _click_checkbox_by_name(page, name_value: str) -> bool:
+    js = f"""
+    (function() {{
+        var inputs = document.querySelectorAll('input[type="checkbox"]');
+        var target = '{name_value.upper()}';
+        for (var inp of inputs) {{
+            if ((inp.name || '').toUpperCase() === target) {{
+                if (!inp.checked) inp.click();
+                return true;
+            }}
+        }}
+        for (var inp of inputs) {{
+            if ((inp.name || '').toUpperCase().includes(target)) {{
+                if (!inp.checked) inp.click();
+                return true;
+            }}
+        }}
+        return false;
+    }})();
+    """
+    return await page.evaluate(js)
+
+
+async def _type_in_filter_search(page, placeholder_keyword: str, search_value: str) -> bool:
+    js = f"""
+    (function() {{
+        var inputs = document.querySelectorAll('input.keysearch-filter');
+        for (var inp of inputs) {{
+            if ((inp.placeholder || '').toLowerCase().includes('{placeholder_keyword.lower()}')) {{
+                var setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                setter.call(inp, '{search_value}');
+                inp.dispatchEvent(new Event('input',  {{bubbles: true}}));
+                inp.dispatchEvent(new KeyboardEvent('keyup', {{bubbles: true}}));
+                return true;
+            }}
+        }}
+        return false;
+    }})();
+    """
+    return await page.evaluate(js)
+
+
+async def _apply_featured_filter(page, filter_id: str) -> bool:
+    js = f"""
+    (function() {{
+        var btn = document.getElementById('{filter_id}');
+        if (btn) {{ btn.click(); return true; }}
+        return false;
+    }})();
+    """
+    ok = await page.evaluate(js)
+    if ok:
+        print(f"    [iaai] Clicked featured filter: {filter_id}", flush=True)
+    else:
+        print(f"    [iaai] [warn] Featured filter button not found: {filter_id}", flush=True)
+    await asyncio.sleep(WAIT_SHORT)
+    return bool(ok)
+
+
+async def _apply_year_filter(page, year_min, year_max) -> None:
+    year_min = str(year_min) if year_min else ""
+    year_max = str(year_max) if year_max else ""
+    if not year_min and not year_max:
+        return
+    print(f"    [iaai] Setting Year: {year_min} - {year_max}", flush=True)
+    if year_min:
+        await _set_input_value(page, "YearFilterFrom", year_min)
+        await asyncio.sleep(0.3)
+    if year_max:
+        await _set_input_value(page, "YearFilterTo", year_max)
+        await asyncio.sleep(0.3)
+    js = """
+    (function() {
+        var btns = document.querySelectorAll('#YearFilter button');
+        for (var b of btns) {
+            if (b.innerText.includes('Apply')) { b.click(); return true; }
+        }
+        return false;
+    })();
+    """
+    await page.evaluate(js)
+    await asyncio.sleep(WAIT_MEDIUM)
+
+
+async def _apply_odometer_filter(page, odo_max) -> None:
+    odo_max = str(odo_max) if odo_max else ""
+    if not odo_max:
+        return
+    print(f"    [iaai] Setting Odometer max: {odo_max}", flush=True)
+    await _set_input_value(page, "ODOValueFilterTo", odo_max)
+    await asyncio.sleep(0.3)
+    js = """
+    (function() {
+        var btns = document.querySelectorAll('#ODOValueFilter button');
+        for (var b of btns) {
+            if (b.innerText.includes('Apply')) { b.click(); return true; }
+        }
+        return false;
+    })();
+    """
+    await page.evaluate(js)
+    await asyncio.sleep(WAIT_MEDIUM)
+
+
+async def _apply_make_filter(page, make: str) -> bool:
+    """Returns True if the Make checkbox was found and clicked (or unset)."""
+    if not make:
+        return True
+    print(f"    [iaai] Setting Make: {make}", flush=True)
+    await _type_in_filter_search(page, "make", make)
+    await asyncio.sleep(WAIT_SHORT)
+    ok = await _click_checkbox_by_name(page, make)
+    if not ok:
+        print(f"    [iaai] [warn] Make checkbox not found: {make}", flush=True)
+    await asyncio.sleep(WAIT_MEDIUM)
+    return bool(ok)
+
+
+async def _apply_model_filter(page, model: str) -> bool:
+    """Click the IAAI Model checkbox.
+
+    `_click_checkbox_by_name` matches by checkbox `name` using substring, so
+    multi-word models like 'GLE 350' fail when IAAI only lists 'GLE'. Fall
+    back to the first word of the model — the caller's Equipment post-filter
+    narrows trims (e.g. Equipment='350 4MATIC' catches exactly that trim).
+    """
+    if not model:
+        return True
+    print(f"    [iaai] Setting Model: {model}", flush=True)
+    await _type_in_filter_search(page, "model", model)
+    await asyncio.sleep(WAIT_SHORT)
+    ok = await _click_checkbox_by_name(page, model)
+
+    first = model.split(" ", 1)[0] if " " in model else ""
+    if not ok and first and first != model:
+        print(f"    [iaai] Model '{model}' not found — retrying with '{first}'", flush=True)
+        await _type_in_filter_search(page, "model", first)
+        await asyncio.sleep(WAIT_SHORT)
+        ok = await _click_checkbox_by_name(page, first)
+
+    if not ok:
+        print(f"    [iaai] [warn] Model checkbox not found: {model}", flush=True)
+    await asyncio.sleep(WAIT_MEDIUM)
+    return bool(ok)
+
+
+async def _apply_fuel_type_filter(page, fuel_type: str) -> None:
+    if not fuel_type:
+        return
+    print(f"    [iaai] Setting Fuel Type: {fuel_type}", flush=True)
+    ok = await _click_checkbox_by_name(page, fuel_type)
+    if not ok:
+        print(f"    [iaai] [warn] Fuel Type checkbox not found: {fuel_type}", flush=True)
+    await asyncio.sleep(WAIT_MEDIUM)
+
+
+async def _apply_model_filters(page, models: list) -> bool:
+    applied = []
+    for m in models:
+        ok = await _apply_model_filter(page, m)
+        if ok:
+            applied.append(m)
+        else:
+            print(f"    [iaai] [!] Model '{m}' not found on site — skipping it.", flush=True)
+    if models and not applied:
+        print("    [iaai] [!] No requested models available — skipping scrape.", flush=True)
+        return False
+    return True
+
+
+async def _scrape_current_page(page) -> list[dict]:
+    js = """
+    (function() {
+        var results = [];
+        var rows = document.querySelectorAll('.table-row.table-row-border');
+        rows.forEach(function(row) {
+            var rec = {};
+            var heading = row.querySelector('.table-cell--heading a');
+            if (heading) {
+                rec['_full_title'] = heading.innerText.trim();
+                rec['Link']        = heading.href;
+                var parts  = rec['_full_title'].split(' ');
+                rec['Year']  = parts[0] || '';
+                rec['Make']  = parts[1] || '';
+                rec['Model'] = parts.slice(2).join(' ');
+            }
+            var stockEl = row.querySelector('[title^="Stock #"]');
+            if (stockEl) rec['Lot Number'] = stockEl.innerText.trim();
+            var dmgEl = row.querySelector('[title^="Primary Damage"]');
+            if (dmgEl) rec['Primary Damage'] = dmgEl.innerText.trim();
+            var odoEl = row.querySelector('[title^="Odometer"]');
+            if (odoEl) rec['Odometer'] = odoEl.innerText.trim().replace(/[^\\d,]/g, '');
+            var fuelEl = row.querySelector('[title^="Fuel Type"]');
+            if (fuelEl) rec['Fuel Type'] = fuelEl.innerText.trim();
+            var locEl = row.querySelector('.data-list--data a[aria-label="Branch Name"]');
+            if (locEl) rec['Location'] = locEl.innerText.trim();
+            var dateEl = row.querySelector('.data-list__value--action');
+            if (dateEl) rec['Auction Date'] = dateEl.innerText.trim();
+            var priceEl = row.querySelector('[title^="ACV:"]');
+            if (priceEl) {
+                var ptext = priceEl.getAttribute('title') || '';
+                rec['ACV'] = ptext.replace('ACV: ', '').trim();
+            }
+            results.push(rec);
+        });
+        return JSON.stringify(results);
+    })();
+    """
+    raw_str = _unwrap_evaluate_result(await page.evaluate(js))
+    if not raw_str:
+        return []
+    try:
+        rows = json.loads(raw_str)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [r for r in (_parse_scraped_row(row) for row in rows) if r is not None]
+
+
+async def _get_total_pages(page) -> int:
+    js = """
+    (function() {
+        var el = document.querySelector('.pages-count span:last-child');
+        return el ? parseInt(el.innerText) : 1;
+    })();
+    """
+    try:
+        val = await page.evaluate(js)
+        return int(val) if val else 1
+    except Exception:
+        return 1
+
+
+async def _go_to_next_page(page) -> bool:
+    js = """
+    (function() {
+        var btn = document.querySelector('.btn-next');
+        if (btn && !btn.disabled) { btn.click(); return true; }
+        return false;
+    })();
+    """
+    ok = await page.evaluate(js)
+    if ok:
+        await asyncio.sleep(WAIT_MEDIUM)
+    return bool(ok)

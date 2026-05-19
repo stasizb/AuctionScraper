@@ -112,31 +112,5 @@ class TestIaaiSearch(unittest.TestCase):
         self.assertEqual(calls["many"],         1)
         self.assertEqual(calls["with_filters"], 0)
 
-    def test_process_passes_tab_concurrency_to_browser_client(self):
-        """When --tab-concurrency arrives at process(), it must reach
-        BrowserIAAIClient — that's the whole point of the flag."""
-        from unittest.mock import patch
-        from clients import iaai as iaai_client
-
-        captured = {}
-
-        def fake_ctor(**kwargs):
-            captured.update(kwargs)
-            class Stub:
-                def scrape_many(self, rows): return []
-                def scrape_with_filters(self, f, clear_filters=False): return []
-            return Stub()
-
-        with tempfile.TemporaryDirectory() as tmp:
-            inp = Path(tmp) / "f.csv"
-            out = Path(tmp) / "o.csv"
-            inp.write_text("Make: HONDA, Model: CR-V\n")
-
-            with patch.object(iaai_client, "BrowserIAAIClient", side_effect=fake_ctor):
-                iaai_search.process(str(inp), str(out), tab_concurrency=4)
-
-        self.assertEqual(captured.get("tab_concurrency"), 4)
-
-
 if __name__ == "__main__":
     unittest.main()
