@@ -29,3 +29,43 @@
       each parallel worker enters `async with job_log():` and its prints
       buffer per-task, flushing as one contiguous block at exit. Applied
       to IAAI's filter-row workers and bidfax's per-lot workers.
+
+- [ ] Replace bidfax with direct Copart / IAAI sold-price lookups.
+      Today bidfax_run.py opens a Chromium session per lot (in-place
+      flow as of 4d71c3e — Cloudflare + reCAPTCHA + ~10s/lot wall time)
+      just to read the final sale price + VIN + canonical URL. Bidfax
+      itself is a scraper-aggregator that ingests this from Copart's /
+      IAAI's own public-facing sold-lot data, then re-hosts it behind
+      bot-defense. If we can hit the original source instead, we drop
+      bidfax entirely and reuse the Playwright cookie warmups we
+      already have for Copart (clients/copart_session.py) and IAAI
+      (clients/iaai_session.py).
+
+      Three open questions to answer before doing anything:
+
+       1. **Does Copart's public API expose `soldFor` / `highBid` for
+          ended lots?** Our `/public/lots/search-results` only returns
+          active auctions, but the lot-detail SPA almost certainly
+          fires an XHR with the sold price (we never sniffed it — the
+          recon was focused on the search step). A ~10-min recon will
+          show whether such a field exists in any reachable endpoint.
+
+       2. **Same for IAAI's `Past Auctions`.** Their public page is
+          unauthenticated; if `/Search?c=<ts>` accepts a past-date
+          filter (or there's a sibling endpoint), we can plug it into
+          the existing iaai_session warmup.
+
+       3. **Coverage.** Even if both expose sold prices, do they cover
+          the same set bidfax does? Sometimes auction sites prune
+          ended lots from their public surface within hours; bidfax
+          may still hold them. If so, bidfax remains the fallback for
+          the long tail.
+
+      Outcomes:
+        * 1 + 2 + good coverage → replace bidfax entirely. bidfax_run.py
+          becomes a thin coordinator over Copart/IAAI session clients.
+        * 1 XOR 2 good → replace half of bidfax (one auction's lots
+          take the new path, the other still uses bidfax).
+        * Neither → bidfax stays; possible smaller win by replaying
+          its form-submit POST with a fetched reCAPTCHA v3 token from
+          a single short Playwright session (skip per-lot browser).
