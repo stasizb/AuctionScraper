@@ -46,7 +46,6 @@ USAGE:
 import argparse
 import csv
 import os
-import socket
 import subprocess
 import sys
 import threading
@@ -56,7 +55,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from core.chrome         import find_chrome
 from core.csv_io         import find_recent_search
 from core.logging_setup  import setup_logging
 
@@ -65,49 +63,6 @@ from core.logging_setup  import setup_logging
 # looked like "IAAI didn't start" when it was actually just running
 # silently behind buffers. Force line-buffered mode globally.
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _cdp_ready(port: int, timeout: float = 15.0) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                return True
-        except OSError:
-            time.sleep(0.3)
-    return False
-
-
-def _start_shared_chrome(profile_dir: Path) -> tuple[subprocess.Popen, int]:
-    """Launch a single Chrome instance shared across all pipeline steps."""
-    port = _free_port()
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    chrome_exe = find_chrome()
-    proc = subprocess.Popen(
-        [
-            chrome_exe,
-            f"--remote-debugging-port={port}",
-            "--remote-debugging-host=127.0.0.1",
-            "--no-first-run", "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-session-crashed-bubble",
-            "--window-size=1400,900",
-            f"--user-data-dir={profile_dir}",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if not _cdp_ready(port):
-        proc.terminate()
-        raise RuntimeError(f"Shared Chrome did not start on port {port}")
-    print(f"[*] Shared Chrome started on port {port}")
-    return proc, port
 
 
 def _resolve_recent_search(output_dir: Path, auction: str, before: date) -> str | None:
@@ -510,10 +465,10 @@ def main() -> None:
 
     workbook     = o("auction_results.xlsx")
     bidfax_cache = str(root / "caches" / "bidfax_cache.json")
-    chrome_profile = root / "caches" / "chrome_profile_shared"
 
-    chrome_proc, browser_port = _start_shared_chrome(chrome_profile)
-    bp = ["--browser-port", str(browser_port)]
+    # No shared-Chrome startup here any more — every browser-bound step
+    # (copart_search, iaai_search, bidfax_run, workbook_to_html's bidfax
+    # VIN lookups) owns its own Playwright / nodriver session.
 
     try:
         # Resolve yesterday's search dates up front so phase 1 can chain
@@ -567,14 +522,11 @@ def main() -> None:
                 "--search-dir",   str(output),
                 "--today-date",   today,
                 "--bidfax-cache", bidfax_cache,
-                *bp,
             ])
         else:
             skip(STEP_HTML_REPORT, skip_reason)
 
     finally:
-        chrome_proc.terminate()
-        print("\n[*] Shared Chrome terminated.")
         _print_summary()
 
     print(f"\n{'=' * 60}")
