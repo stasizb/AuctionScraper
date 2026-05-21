@@ -174,13 +174,38 @@ class BrowserBidfaxClient:
 
     # ---- Async internals ---------------------------------------------------
 
+    # Number of attempts when launching a fresh Chrome via nodriver.
+    # `uc.start()` occasionally fails with "Failed to connect to browser"
+    # — Chrome spawns OK but the CDP WebSocket handshake misses its
+    # internal timeout window. We've seen this 1-in-N times on macOS
+    # under both Copart-API recon and the daily bidfax phase. A short
+    # retry consistently clears it because the next attempt spawns a
+    # fresh Chrome process that doesn't race the handshake.
+    _BROWSER_START_ATTEMPTS = 3
+    _BROWSER_START_BACKOFF_S = 2.0
+
     async def _start_browser(self):
         if self.browser_port:
             return await uc.start(host="127.0.0.1", port=self.browser_port)
-        return await uc.start(
-            headless=False, sandbox=False,
-            browser_args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
+        last_exc: Exception | None = None
+        for attempt in range(1, self._BROWSER_START_ATTEMPTS + 1):
+            try:
+                return await uc.start(
+                    headless=False, sandbox=False,
+                    browser_args=["--no-sandbox", "--disable-dev-shm-usage"],
+                )
+            except Exception as exc:
+                last_exc = exc
+                print(f"    [bidfax] nodriver Chrome start failed "
+                      f"(attempt {attempt}/{self._BROWSER_START_ATTEMPTS}): "
+                      f"{exc.__class__.__name__}: {str(exc).strip().splitlines()[0] if str(exc).strip() else exc!r}",
+                      flush=True)
+                if attempt < self._BROWSER_START_ATTEMPTS:
+                    await asyncio.sleep(self._BROWSER_START_BACKOFF_S)
+        # Out of retries — re-raise the last exception so the caller
+        # gets the original "Failed to connect to browser" detail.
+        assert last_exc is not None
+        raise last_exc
 
     async def _stop_browser(self, browser) -> None:
         try:
