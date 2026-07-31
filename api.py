@@ -49,7 +49,15 @@ def create_app(lookup: AuctionLookup | None = None, token: str | None = None) ->
             payload = service.search(query, auction)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        status = 502 if payload["errors"] and not payload["results"] else 200
+        # A completed multi-source lookup is a valid structured response even
+        # when one or both upstreams fail. 207 makes partial/all-source failure
+        # visible without collapsing the response into a generic gateway error.
+        if auction == "all" and payload["errors"]:
+            status = 207
+        elif payload["errors"]:
+            status = 502
+        else:
+            status = 200
         return jsonify(payload), status
 
     return app

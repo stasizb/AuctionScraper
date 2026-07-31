@@ -9,7 +9,12 @@ import time
 from pathlib import Path
 
 from clients.copart import SEARCH_API_URL
-from clients.copart_session import get_or_warmup_session as copart_session
+from clients.copart_session import (
+    CopartBlockedError,
+    CopartCaptchaError,
+    get_or_warmup_session as copart_session,
+    search_in_browser as copart_browser_search,
+)
 from clients.iaai import IAAI_SEARCH_URL, parse_search_html
 from clients.iaai_session import get_or_warmup_session as iaai_session
 
@@ -68,9 +73,10 @@ def _iaai_row(row: dict) -> dict:
 class AuctionLookup:
     """Lazily creates and reuses warmed HTTP sessions for both auctions."""
 
-    def __init__(self) -> None:
+    def __init__(self, browser_search=None) -> None:
         self._sessions: dict[str, object] = {}
         self._locks = {"copart": threading.Lock(), "iaai": threading.Lock()}
+        self._browser_search = browser_search or copart_browser_search
 
     def _session(self, auction: str):
         if auction in self._sessions:
@@ -93,13 +99,29 @@ class AuctionLookup:
                 "query": [query], "filter": {}, "page": 0, "size": 100,
                 "start": 0, "watchListOnly": False, "freeFormSearch": True,
             }
-            response = self._session("copart").post(
-                SEARCH_API_URL, json=payload, timeout=30
-            )
+            try:
+                session = self._session("copart")
+            except Exception:
+                return self._search_copart_in_browser(query)
+            response = session.post(SEARCH_API_URL, json=payload, timeout=30)
+            if response.status_code == 403:
+                # A requests.Session can still be rejected when the Railway IP
+                # or its HTTP fingerprint is blocked. Retry once inside the
+                # warmed Chromium page, where headers and cookies stay aligned.
+                return self._search_copart_in_browser(query)
             response.raise_for_status()
             content = (((response.json().get("data") or {}).get("results") or {})
                        .get("content", []))
             return [_copart_row(lot) for lot in content]
+
+    def _search_copart_in_browser(self, query: str) -> list[dict]:
+        try:
+            lots = self._browser_search(query, headless=True)
+        except (CopartCaptchaError, CopartBlockedError):
+            raise
+        except Exception as exc:
+            raise CopartBlockedError("Copart Chromium fallback is unavailable") from exc
+        return [_copart_row(lot) for lot in lots]
 
     def search_iaai(self, query: str) -> list[dict]:
         with self._locks["iaai"]:
@@ -129,8 +151,13 @@ class AuctionLookup:
         for source in sources:
             try:
                 results.extend(getattr(self, f"search_{source}")(query))
-            except Exception as exc:
+            except (CopartCaptchaError, CopartBlockedError) as exc:
                 errors[source] = str(exc)
+                self._sessions.pop(source, None)
+            except Exception as exc:
+                # Do not echo response bodies, request headers, cookies, or
+                # credentials from arbitrary client exceptions.
+                errors[source] = f"{source.upper()} source unavailable ({type(exc).__name__})"
                 self._sessions.pop(source, None)
         return {
             "query": query,
