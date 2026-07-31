@@ -2,6 +2,30 @@
 
 Automates the daily workflow of finding, pricing, and reporting on salvage vehicles from **Copart** and **IAAI** auctions.
 
+## Railway HTTP API
+
+The repository includes a Dockerfile that Railway detects automatically.
+Create a service from this repository and deploy it; Railway supplies the
+`PORT` environment variable used by Gunicorn.
+
+```bash
+# Service liveness (does not contact auction sites)
+curl https://YOUR-SERVICE.up.railway.app/health
+
+# Search both auctions by VIN or lot number
+curl 'https://YOUR-SERVICE.up.railway.app/search?q=1HGCM82633A004352'
+curl 'https://YOUR-SERVICE.up.railway.app/search?q=12345678'
+
+# Limit the lookup to one auction
+curl 'https://YOUR-SERVICE.up.railway.app/search?q=12345678&auction=copart'
+curl 'https://YOUR-SERVICE.up.railway.app/search?q=12345678&auction=iaai'
+```
+
+Search responses contain normalized `results` and a per-auction `errors`
+object. Auction sites use bot protection, so the first request can take longer
+while headless Chromium warms the HTTP session. One Gunicorn worker is used so
+the warmed sessions and cookies are reused safely.
+
 ---
 
 ## How it works
